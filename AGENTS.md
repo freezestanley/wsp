@@ -211,6 +211,66 @@ Think of it like a human reviewing their journal and updating their mental model
 
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
 
+
+## 🌐 建站需求 → 自动委托 WebGen(全程逐步直播)
+
+当用户提出**新建网页/页面/网站/dashboard/落地页/官网**类需求时,不要自己手写单文件 HTML,而是**自动把任务委托给 `webgen` agent**,并**全程逐步直播** webgen 的每一步进度。
+
+### 强制直播约束(不可省略)
+
+- **只要进入建站委托流程,就必须开启直播**;不允许“后台悄悄做完再一次性汇报”。
+- **首次委托后立刻播报**:至少说明已委托给哪个 session、当前处于什么阶段(例如 Discovery / 实现 / 验证)。
+- **直播必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
+- **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译成人话同步给用户,不能只在最后做总结。
+- **禁止伪直播**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作播报。
+- **若长时间无更新,保持静默即可**;但一旦出现新步骤,应在下一次轮询时继续直播。
+- **若 main 忘了直播,应立即补播最近关键步骤**,然后恢复正常轮询,不要继续静默执行。
+
+### 触发条件(命中任一即委托)
+
+- 关键词:`生成网站`、`做个网页`、`写一个页面`、`新建页面`、`登录页`、`dashboard`、`数据看板`、`落地页`、`官网`、`我需要一个…的网站/页面`
+- 模式:用户描述一个**可视化网页**需求
+
+### 跳过条件(不委托)
+
+- 用户说「先别做」「只是说说」「先讨论一下」
+- 纯后端/脚本/数据处理,不涉及网页 UI
+- 用户明确要 main 自己出单文件 demo
+
+### ⚠️ 关键:用独立 sessionKey,别用 agentId(避免调度死结)
+
+`sessions_send(agentId="webgen", ...)` **永远只路由到 `agent:webgen:main`**,而该 session 会被 webgen 自己的 SO-002(单项目锁定)锁在某个旧项目上,新项目在那写不了 → 它把任务包弹回 main → main 再走 agentId → **无限 ping-pong 死结**(已踩坑实测)。
+
+**正确做法**:
+- **澄清/Discovery 阶段**(只问问题、不写文件):可以走 `agentId="webgen"` 让 main session 帮忙整理澄清清单。
+- **一旦确认要落地新项目**:**必须**改用独立 sessionKey 委托:`sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`。`<slug>` 用项目英文短名(如 `user-list-table`)。该 sessionKey 是全新无锁 session,webgen 会在那写 lock、做 Discovery、实现、CDP 验证、交付,不会撞锁。
+- 直播时拉的也是这个独立 sessionKey 的 history,不是 `agent:webgen:main`。
+- 若 `agent:webgen:main` 反复弹回"请 main 分配独立 session"的任务包,**别再回它**,直接按上面用 `agent:webgen:proj-<slug>` 开新 session 落地。
+
+### 委托 + 直播流程
+
+1. 把用户**原始需求**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", ...)`**。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前直播目标 sessionKey。
+2. **委托后立即进入直播模式**:每隔约 20–40 秒用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
+   - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
+   - 只播**新增**步骤,不重复已播过的;用简短中文,不贴大段原始日志。
+3. webgen 若**反问澄清**,把问题原样转达用户;用户答复后回传 webgen。
+4. webgen **交付后**,用 main 自己口吻汇总:改了哪些文件、文件在哪、如何预览、blocker/剩余风险。
+5. 直到 webgen 明确交付或报阻塞,才停止直播轮询。
+
+### 直播节流(避免刷屏 / 空轮询)
+
+- 轮询间隔 ≥ 20 秒;用 `process(action=poll, timeout=...)` 或 exec yieldMs 等待,**不要** tight loop。
+- 单次只播 1–3 条关键步骤的人话摘要,不逐字转发工具输出。
+- 没有新步骤时静默,不发“暂无更新”这类噪音。
+- **但首条直播不能省略**:即使还没有拿到实质性工具结果,也要先明确告知“已委托 + 正在进入哪一阶段”。
+
+### 边界
+
+- main 只做**调度 + 翻译播报**,不替 webgen 写页面代码(除非用户明确要 main 出单文件 demo)。
+- 委托是默认行为,用户可随时说「这个你自己做」覆盖。
+- webgen 的 session key 约定为 `agent:webgen:main`(首条 sessions_send 会自动创建)。
+- 前提开关:`tools.agentToAgent.enabled=true` 且 `tools.sessions.visibility=all`,否则跨 agent 委托会被拒。
+
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.
