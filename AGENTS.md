@@ -212,19 +212,29 @@ Think of it like a human reviewing their journal and updating their mental model
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
 
 
-## 🌐 建站需求 → 自动委托 WebGen(全程逐步直播)
+## 🌐 建站需求 → 自动委托 WebGen(全程逐步监听)
 
-当用户提出**新建网页/页面/网站/dashboard/落地页/官网**类需求时,不要自己手写单文件 HTML,而是**自动把任务委托给 `webgen` agent**,并**全程逐步直播** webgen 的每一步进度。
+当用户提出**新建网页/页面/网站/dashboard/落地页/官网**类需求时,不要自己手写单文件 HTML,而是**自动把任务委托给 `webgen` agent**,并**全程逐步监听** webgen 的每一步进度。
 
-### 强制直播约束(不可省略)
 
-- **只要进入建站委托流程,就必须开启直播**;不允许“后台悄悄做完再一次性汇报”。
+### 先读技能(强制)
+
+- 一旦进入建站委托 + 监听流程,先读取 `skills/delegated-live-broadcasting/SKILL.md`,按其中的**首条播报 + wake 链续航**规则执行。
+- 不能只靠 AGENTS 里的口头约束理解为“这一回合里手动多查几次 history 就算监听”。
+- 只要预期监听会跨回合持续,**默认必须建立 cron wake 链**。
+- 要用自己在完成任务的角度去回复
+
+### 强制监听约束(不可省略)
+
+- **只要进入建站委托流程,就必须开启监听**;不允许“后台悄悄做完再一次性汇报”。
 - **首次委托后立刻播报**:至少说明已委托给哪个 session、当前处于什么阶段(例如 Discovery / 实现 / 验证)。
-- **直播必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
+- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 20–40 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 `sessionTarget:"current" + payload.kind:"agentTurn"` 绑定当前会话;只有当前回合本来就会持续挂起等待时,才可不用 wake。
+- **监听必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
 - **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译成人话同步给用户,不能只在最后做总结。
-- **禁止伪直播**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作播报。
-- **若长时间无更新,保持静默即可**;但一旦出现新步骤,应在下一次轮询时继续直播。
-- **若 main 忘了直播,应立即补播最近关键步骤**,然后恢复正常轮询,不要继续静默执行。
+- **禁止伪监听**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作播报。
+- **若长时间无更新,保持静默即可**;但一旦出现新步骤,应在下一次轮询时继续监听。
+- **若 main 忘了监听,应立即补播最近关键步骤**,然后恢复正常轮询,不要继续静默执行。
+- **若只发了首条提示但没建 wake/等待链路,视为监听未启动**。
 
 ### 触发条件(命中任一即委托)
 
@@ -244,30 +254,46 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 **正确做法**:
 - **澄清/Discovery 阶段**(只问问题、不写文件):可以走 `agentId="webgen"` 让 main session 帮忙整理澄清清单。
 - **一旦确认要落地新项目**:**必须**改用独立 sessionKey 委托:`sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`。`<slug>` 用项目英文短名(如 `user-list-table`)。该 sessionKey 是全新无锁 session,webgen 会在那写 lock、做 Discovery、实现、CDP 验证、交付,不会撞锁。
-- 直播时拉的也是这个独立 sessionKey 的 history,不是 `agent:webgen:main`。
+- 监听时拉的也是这个独立 sessionKey 的 history,不是 `agent:webgen:main`。
 - 若 `agent:webgen:main` 反复弹回"请 main 分配独立 session"的任务包,**别再回它**,直接按上面用 `agent:webgen:proj-<slug>` 开新 session 落地。
 
-### 委托 + 直播流程
+### 委托 + 监听流程
 
 **硬约束:只要是建站需求相关委托,都必须把用户输入原封不动、准确且完整地转交给 webgen,禁止 main 对用户原始输入做任何改写、润色、删减、补写、改述或重构。**
-- 可以在原文之外**追加**必要的调度说明(例如 sessionKey、直播要求、让 webgen 按自身流程执行),但**用户原始输入本体必须完整保留且逐字转发**。
+- 可以在原文之外**追加**必要的调度说明(例如 sessionKey、监听要求、让 webgen 按自身流程执行),但**用户原始输入本体必须完整保留且逐字转发**。
 - 若需要补充 main 自己整理的约束、假设或背景,必须明确标注为“附加说明”或等价标签,不得与用户原文混写成一段,避免让 webgen误以为这些也是用户原话。
 - 若用户输入很短、很模糊、甚至只有一句话,也仍然必须先逐字转发该原话,再另行补充调度说明。
 
-1. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", ...)`**。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前直播目标 sessionKey。
-2. **委托后立即进入直播模式**:每隔约 20–40 秒用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
+1. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", ...)`**。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
+2. **委托后立即进入监听模式**:
+   - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
+   - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 `sessionTarget:"current" + payload.kind:"agentTurn" + delivery.mode:"announce"` 把续播绑定回当前对话,提醒 main 检查该 session 的新增进展。
+   - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
+   - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
    - 只播**新增**步骤,不重复已播过的;用简短中文,不贴大段原始日志。
 3. webgen 若**反问澄清**,把问题原样转达用户;用户答复后回传 webgen。
 4. webgen **交付后**,用 main 自己口吻汇总:改了哪些文件、文件在哪、如何预览、blocker/剩余风险。
-5. 直到 webgen 明确交付或报阻塞,才停止直播轮询。
+5. 若 wake 回合里发现任务**尚未交付也未阻塞**,必须再次 `cron.add` / `cron.update` 安排下一次 wake,形成连续监听链。
+6. 直到 webgen 明确交付、明确阻塞且需要用户决策,或任务被取消,才停止监听轮询。
 
-### 直播节流(避免刷屏 / 空轮询)
+### 为什么这里不用 `sessionTarget:"main" + systemEvent`
 
-- 轮询间隔 ≥ 20 秒;用 `process(action=poll, timeout=...)` 或 exec yieldMs 等待,**不要** tight loop。
+- `sessionTarget:"main"` 的 `systemEvent` 会进入 main 的 **cron 运行 session**，不等于“回到当前 webchat 对话继续说话”。
+- 这会导致看起来像“wake 跑了”，但实际续播发生在独立 cron session 里，而不是当前用户会话。
+- 所以,凡是目标是“继续在当前用户对话里监听”,默认都应改用 **`sessionTarget:"current"` 的 `agentTurn`**。
+
+### 监听节流(避免刷屏 / 空轮询)
+
+- 轮询间隔 ≥ 20 秒;跨回合默认用 `cron wake`,不要用 tight loop 假装长期轮询。
 - 单次只播 1–3 条关键步骤的人话摘要,不逐字转发工具输出。
 - 没有新步骤时静默,不发“暂无更新”这类噪音。
-- **但首条直播不能省略**:即使还没有拿到实质性工具结果,也要先明确告知“已委托 + 正在进入哪一阶段”。
+- **但首条监听不能省略**:即使还没有拿到实质性工具结果,也要先明确告知“已委托 + 正在进入哪一阶段”。
+
+### wake prompt 建议模板
+
+- `【继续监听任务】检查 webgen session=<sessionKey> 的新增进展; 若有新增步骤,向当前用户监听 1–3 条中文摘要; 若未交付且未阻塞,继续安排下一次 20–40 秒后的 current-session wake。`
+- 如果已经播报过某个 seq/阶段,可把它写进 prompt,帮助下一回合快速恢复上下文。
 
 ### 边界
 
