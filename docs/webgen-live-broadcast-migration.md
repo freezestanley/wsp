@@ -128,6 +128,7 @@ wake 回合拿到该 payload 后,再由 main 主动:
 1. 可见文本只能是这 4 个字,不能附带 token 与自然语言说明
 2. 本地摘要层必须把这类文本识别为内部 wake 文本并过滤
 3. 旧格式 `当前进度为：__oc_live__...` 仍保留兼容识别,但不再新生成
+4. `REPLY_SKIP`、`inter-session routing echo`、`Nothing to broadcast`、`Staying silent` 这类内部跳过/回声文本也必须静默过滤
 
 ---
 

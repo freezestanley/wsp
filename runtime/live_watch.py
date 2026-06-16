@@ -112,6 +112,17 @@ def is_internal_prompt_text(text: str) -> bool:
         return True
     if "payload.kind:\"agentturn\"" in lowered or "delivery.mode:\"announce\"" in lowered:
         return True
+    internal_markers = [
+        "inter-session routing echo",
+        "not new content from webgen",
+        "not a user instruction",
+        "reply_skip",
+        "nothing to broadcast",
+        "staying silent",
+        "another routing echo of my own prior message",
+    ]
+    if any(marker in lowered for marker in internal_markers):
+        return True
     return False
 
 

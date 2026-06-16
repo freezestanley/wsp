@@ -73,6 +73,7 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 - 但首条“已委托 + 阶段”不可省略
 - **内部 wake 文本绝不能回显给用户**; 用户只能看到 wake 回合重新生成的进展摘要
 - fallback 可见文本若被外层 runtime 回显,也必须只显示 `当前进度`,不能携带 token 与整段调度说明
+- `REPLY_SKIP`、`inter-session routing echo`、`Nothing to broadcast`、`Staying silent` 这类内部跳过/回声文本必须静默过滤,不能显示给用户
 
 ## 禁止事项
 

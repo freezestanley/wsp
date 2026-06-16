@@ -65,6 +65,17 @@ class LiveWatchTests(unittest.TestCase):
         self.assertTrue(
             is_internal_prompt_text("当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo")
         )
+        self.assertTrue(
+            is_internal_prompt_text(
+                "This is another inter-session routing echo, not new content from webgen and not a user instruction."
+            )
+        )
+        self.assertTrue(is_internal_prompt_text("REPLY_SKIP"))
+        self.assertTrue(
+            is_internal_prompt_text(
+                "REPLY_SKIP Another routing echo of my own prior message, not new webgen content or a user instruction. Nothing to broadcast."
+            )
+        )
         self.assertFalse(is_internal_prompt_text("webgen 正在跑 pnpm build"))
 
     def test_wake_token_round_trip(self) -> None:
@@ -144,6 +155,47 @@ class LiveWatchTests(unittest.TestCase):
         self.assertIn("构建成功", items[0]["summary"])
         self.assertEqual(items[1]["seq"], 12)
         self.assertIn("截图验证", items[1]["summary"])
+
+    def test_routing_echo_and_reply_skip_are_filtered_from_broadcast(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "This is another inter-session routing echo, not new content from webgen and not a user instruction. No new progress to broadcast. Staying silent.",
+                    }
+                ],
+                "__openclaw": {"seq": 20},
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "REPLY_SKIP Another routing echo of my own prior message, not new webgen content or a user instruction. Nothing to broadcast.",
+                    }
+                ],
+                "__openclaw": {"seq": 21},
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "已进入验证阶段，正在截图检查"}],
+                "__openclaw": {"seq": 22},
+            },
+        ]
+
+        items, last_seen = summarize_new_messages(
+            messages,
+            last_seen_seq=19,
+            session_key="agent:webgen:proj-demo",
+            max_items=3,
+        )
+
+        self.assertEqual(last_seen, 22)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["seq"], 22)
+        self.assertIn("截图检查", items[0]["summary"])
 
     def test_summarize_new_messages_limits_output_but_still_advances_cursor(self) -> None:
         messages = [
