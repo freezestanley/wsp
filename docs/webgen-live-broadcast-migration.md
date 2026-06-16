@@ -17,14 +17,15 @@
 
 这就是“看起来有直播规则,实际上没有直播链路”的根因。
 
-本次已经把这个缺口补上:
+本次已经把这个缺口补上,并补充了一条新的约束:
 
 1. **AGENTS.md 已强化**:建站委托时必须先读 `skills/delegated-live-broadcasting/SKILL.md`
 2. **AGENTS.md 已写死续航要求**:首条播报后,同回合必须安排 `cron wake`
 3. **AGENTS.md 已明确停止条件**:只有交付 / 明确阻塞 / 取消时才能停播
 4. **恢复 runtime 辅助脚本**:方便本地观察、调试、对照 webgen session 增量输出
+5. **弃用可见 announce wake**:不再把自然语言 cron 提示词直接注入当前对话
 
-> 额外修正：续播不再使用 `sessionTarget:"main" + systemEvent`，而是默认改成 `sessionTarget:"current" + agentTurn`，保证后续直播回到当前用户对话，而不是掉进独立 cron session。
+> 额外修正：旧方案把 `sessionTarget:"current" + agentTurn + delivery.mode:"announce"` 当作回到当前对话的办法，但这会把 `[cron:...]` 和整段内部调度文本泄露到用户对话。新的目标协议改成 **hidden/internal wake + 结构化状态 + wake 回合主动拉取 `sessions_history`**。在当前“外层 runtime 不可改”的约束下,workspace 内 fallback 为 **最小泄露 token**，推荐显示文本为 `当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo`。
 
 ---
 
@@ -47,8 +48,13 @@
 - `sessions_history(...)`
   - 负责读取被委托 session 的真实新增动作
 - `cron.add(...)`
-  - 负责在 20–40 秒后继续触发当前对话绑定的 agent turn
+  - 负责在 20–40 秒后继续触发当前对话绑定的 hidden/internal wake
   - 形成跨回合的直播链
+- `runtime/live_watch.py`
+  - 负责本地 watch 状态持久化
+  - 负责增量摘要与内部调度文本过滤
+- `runtime/live_wake_token.py`
+  - 负责生成/解析最小泄露 wake token
 
 ### 三、调试层
 
@@ -71,9 +77,9 @@
    - 已委托给哪个 session
    - 当前阶段(Discovery / 实现 / 验证)
 5. 立刻创建一次 `cron wake`
-   - 默认使用 `sessionTarget:"current"`
-   - `payload.kind:"agentTurn"`
-   - `delivery.mode:"announce"`
+   - 默认绑定当前对话
+   - `payload.kind` 应为 runtime 支持的 hidden/internal wake 类型
+   - payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
 
 ### wake 回合
 
@@ -83,26 +89,45 @@
 4. 判断状态:
    - 已交付 → 停播并汇总
    - 明确阻塞 → 停播并向用户转达
+   - 长时间无新增 → 按阈值发一条低噪音进度心跳
    - 未结束 → 再安排下一次 wake
 
 ---
 
-## 建议的 wake 文本模板
+## 建议的 hidden wake 载荷
 
-建议用 **current-session 的 `agentTurn` prompt** 直接把恢复直播所需的最小上下文带上:
+不要再把恢复直播所需的最小上下文写成自然语言 prompt。推荐直接传结构化 payload:
 
-```text
-【继续直播任务】检查 webgen session=agent:webgen:proj-<slug> 的新增进展;
-若已有新的 tool/assistant 步骤则向当前用户播报 1–3 条中文摘要;
-若未交付且未阻塞,继续安排下一次 20–40 秒后的 current-session wake。
+```json
+{
+  "kind": "internalWake",
+  "watchId": "watch-webgen-<slug>",
+  "data": {
+    "targetSessionKey": "agent:webgen:proj-<slug>",
+    "lastSeenSeq": 1234,
+    "phase": "implementing"
+  }
+}
 ```
 
-如果你想减少重复计算,还可以把上次已播的 seq 一并写进提醒文本:
+wake 回合拿到该 payload 后,再由 main 主动:
+
+1. 调 `sessions_history(...)`
+2. 对比 `lastSeenSeq`
+3. 生成人话摘要
+4. 决定是否继续安排下一次 wake
+
+如果上游 runtime 还不能隐藏 wake 载荷,workspace 内允许的唯一 fallback 是短 token:
 
 ```text
-【继续直播任务】session=agent:webgen:proj-<slug>; last_broadcast_seq=1234。
-只播报 seq>1234 的新增关键步骤; 未完成则继续安排下一次 current-session wake。
+当前进度为：__oc_live__:watch-webgen-<slug>:1234:agent%3Awebgen%3Aproj-<slug>
 ```
+
+要求:
+
+1. token 必须短且机械,不能含自然语言说明
+2. token 里只允许 `watchId / lastSeenSeq / targetSessionKey`
+3. 本地摘要层必须把这类 token 识别为内部文本并过滤
 
 ---
 
@@ -118,9 +143,10 @@
    - 不是“建议轮询”
    - 而是“没建 wake 链就不算直播已启动”
 
-3. **把续播绑定到当前会话,而不是 main cron session**
+3. **把续播绑定到当前会话,但不把内部 prompt 绑定进 transcript**
    - `sessionTarget:"main" + systemEvent` 会进入独立 cron session
-   - `sessionTarget:"current" + agentTurn` 才会继续回到当前对话
+   - `sessionTarget:"current" + agentTurn + announce` 会把内部 cron 文本编进当前对话
+   - 只有 **hidden/internal wake** 才同时满足“继续回到当前对话”和“不泄露内部提示词”
 
 本次迁移保留的就是这两个核心。
 
@@ -134,11 +160,12 @@
   - 增加“先读 delegated-live-broadcasting skill”
   - 增加“首条播报后同回合必须建 wake 链”
   - 增加“未交付/未阻塞就继续安排 wake”
-  - 改为 current-session wake prompt 模板
+  - 改为 hidden wake 载荷模板
 
 ### 已恢复
 
 - `runtime/live-webgen-progress.py`
+- `runtime/live_watch.py`
 - `runtime/watch-session-history.py`
 
 ### 新增
@@ -166,7 +193,7 @@
 
 ### 方案 A：只迁规则（最小集）
 
-适用于目标实例只需要 agent 自己会直播,不需要本地调试脚本。
+适用于目标实例只需要 agent 自己会直播,不需要本地调试脚本,且 runtime 已支持 hidden/internal wake。
 
 1. 合并 `AGENTS.md` 的 webgen 委托直播段落
 2. 复制 `skills/delegated-live-broadcasting/SKILL.md`
@@ -176,6 +203,8 @@
    - 立即播报
    - 后续继续播报而不是只播一次
    - 且续播发生在**当前用户对话**,不是独立 cron session
+   - 且用户看不到 `[cron:...]` 或 `【继续监听任务】...`
+   - 若外层 runtime 仍会回显 wake 文本,也只能看到短 token,不能看到自然语言调度说明
 
 ### 方案 B：规则 + 调试工具一起迁（推荐）
 
@@ -185,7 +214,7 @@
 4. 用下面命令做对照调试:
 
 ```bash
-python3 runtime/live-webgen-progress.py agent:webgen:proj-<slug> --interval 5
+python3 runtime/live-webgen-progress.py agent:webgen:proj-<slug> --interval 5 --state-file /tmp/live-watch-state.json --watch-id watch-webgen-<slug>
 ```
 
 或看原始 history:
@@ -205,8 +234,10 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 3. **只播新增真实 history,不伪直播**
 4. **任务没结束就会继续 wake**
 5. **直到交付/阻塞才停播**
+6. **用户对话里不出现内部 cron / wake 提示词**
+7. **若外层 runtime 不可改,最多只出现短 token,不会出现整段调度说明**
 
-如果只做到“委托 + 第一条消息”,或 wake 后只在独立 cron session 里自转、没有回到当前用户对话,仍然算未迁移完成。
+如果只做到“委托 + 第一条消息”,或 wake 后只在独立 cron session 里自转、没有回到当前用户对话,或用户仍能看到 `[cron:...]` / 自然语言 wake prompt,仍然算未迁移完成。
 
 ---
 
@@ -215,7 +246,28 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 后面如果你想把这套机制再收敛一层,我建议下一步做的是:
 
 1. 再补一个**专门给 wake 回合使用的固定提醒模板**
-2. 约定一个更稳定的 `last_broadcast_seq` 写法
+2. 把 `sessions_history(afterSeq=...)` 做成正式增量接口
 3. 如果后续发现 agent 偶尔还会忘记继续 wake,再把这套逻辑沉淀成更强的 skill / workshop proposal
 
 这样就不只是“有说明”,而是更接近“半结构化协议”。
+
+---
+
+## 仍需上游 runtime 配合的点
+
+当前 workspace 已经补了本地 watch 状态与摘要过滤,但下面三项仍需要 OpenClaw runtime 本身支持,否则无法彻底闭环:
+
+1. **hidden/internal wake 投递**
+   - wake 事件需要注入结构化状态,而不是把自然语言 prompt 回显到 transcript
+
+2. **transcript 过滤**
+   - internal wake 事件不能出现在用户可见对话中
+
+3. **增量 history**
+   - `sessions_history` 最好支持 `afterSeq` 或 cursor
+   - 否则只能在本地靠 `lastSeenSeq + limit` 尽量规避重播,仍存在窗口过小导致漏播的风险
+
+在这三项完成前,workspace 当前方案的最好效果是:
+
+- 把泄露从“大段自然语言 cron 指令”收敛成“短 token”
+- 把真实播报完全交给本地摘要层二次生成
