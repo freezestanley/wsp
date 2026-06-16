@@ -13,11 +13,11 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.live_watch import (
+    build_broadcast_batch,
     WatchState,
     load_watch_state,
-    maybe_create_heartbeat,
+    record_control_event,
     record_cycle_state,
-    record_heartbeat_sent,
     save_watch_state,
     summarize_new_messages,
 )
@@ -112,7 +112,10 @@ def main() -> int:
     parser.add_argument('--state-file', help='持久化 watch 游标的 JSON 文件路径')
     parser.add_argument('--watch-id', default='default', help='state-file 下的 watch 标识，默认 default')
     parser.add_argument('--heartbeat-idle-polls', type=int, default=3, help='连续多少次无新增后发进度心跳，默认 3')
-    parser.add_argument('--heartbeat-interval-seconds', type=float, default=75.0, help='两次进度心跳的最小间隔秒数，默认 75')
+    parser.add_argument('--heartbeat-interval-seconds', type=float, default=60.0, help='两次进度心跳的最小间隔秒数，默认 60')
+    parser.add_argument('--control-event-id', help='可选：注入一条委托/控制面同步事件 id')
+    parser.add_argument('--control-summary', help='可选：注入一条委托/控制面同步事件摘要')
+    parser.add_argument('--control-phase', help='可选：注入控制面事件后的阶段标记')
     args = parser.parse_args()
 
     cfg = load_config()
@@ -125,6 +128,14 @@ def main() -> int:
     )
     current_session_key = watch_state.target_session_key or args.session_key
     last_seen = args.since_seq if args.since_seq is not None else watch_state.last_seen_seq
+
+    if args.control_event_id and args.control_summary:
+        watch_state = record_control_event(
+            watch_state,
+            event_id=args.control_event_id,
+            summary=args.control_summary,
+            phase=args.control_phase,
+        )
 
     if not args.jsonl:
         print_intro(current_session_key, args.interval)
@@ -149,25 +160,22 @@ def main() -> int:
             watch_state.target_session_key = current_session_key
             watch_state.last_seen_seq = last_seen
             watch_state = record_cycle_state(watch_state, items, now)
-            heartbeat = None
-            if not items:
-                heartbeat = maybe_create_heartbeat(
-                    watch_state,
-                    now,
-                    min_idle_polls=args.heartbeat_idle_polls,
-                    min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
-                )
-            for item in items:
+            batch, watch_state = build_broadcast_batch(
+                watch_state,
+                items,
+                now,
+                max_items=args.max_items,
+                min_idle_polls=args.heartbeat_idle_polls,
+                min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+            )
+            for item in batch:
                 if args.jsonl:
                     print(json.dumps(item, ensure_ascii=False), flush=True)
                 else:
-                    print(f'[{item["seq"]}] {item["summary"]}', flush=True)
-            if heartbeat is not None:
-                if args.jsonl:
-                    print(json.dumps(heartbeat, ensure_ascii=False), flush=True)
-                else:
-                    print(heartbeat['summary'], flush=True)
-                watch_state = record_heartbeat_sent(watch_state, now)
+                    if item.get("seq") is not None and item["kind"] in {"tool", "assistant"}:
+                        print(f'[{item["seq"]}] {item["summary"]}', flush=True)
+                    else:
+                        print(item["summary"], flush=True)
             if state_path:
                 save_watch_state(state_path, watch_state)
         except KeyboardInterrupt:

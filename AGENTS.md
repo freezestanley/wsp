@@ -228,12 +228,13 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 - **只要进入建站委托流程,就必须开启监听**;不允许“后台悄悄做完再一次性汇报”。
 - **首次委托后立刻播报**:至少说明已委托给哪个 session、当前处于什么阶段(例如 Discovery / 实现 / 验证)。
-- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 20–40 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 **hidden wake / internal wake** 绑定当前会话,只传结构化状态,**严禁**把自然语言调度提示词通过 `delivery.mode:"announce"` 直接投进对话框;若 runtime 还不支持 hidden wake,降级为最小泄露 token,推荐显示文本为 `当前进度为：__oc_live__:<watchId>:<lastSeenSeq>:<urlencodedSessionKey>`,不要再发送整段自然语言指令;只有当前回合本来就会持续挂起等待时,才可不用 wake。
+- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 20–40 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 **hidden wake / internal wake** 绑定当前会话,只传结构化状态,**严禁**把自然语言调度提示词通过 `delivery.mode:"announce"` 直接投进对话框;若 runtime 还不支持 hidden wake,可见文本只允许显示 `当前进度` 这 4 个字,不要再发送整段自然语言指令;只有当前回合本来就会持续挂起等待时,才可不用 wake。
 - **监听必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
 - **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译成人话同步给用户,不能只在最后做总结。
+- **委托同步也可播报**:例如“已把你的确认同步给 webgen”“已收到用户答复并回传给 webgen”。但这类控制面同步的优先级低于真实执行新增,不要让委托消息淹没实际进度。
 - **禁止伪监听**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作播报。
 - **若长时间无更新,保持静默即可**;但一旦出现新步骤,应在下一次轮询时继续监听。
-- **若长时间无更新,可发低噪音进度心跳**:仅在连续多次轮询无新增、且距离上次心跳已超过阈值时,允许发一条简短确认,例如“当前进度为：仍在验证阶段,最近一次动作是…”。不要把心跳做成高频刷屏。
+- **若长时间无更新,可发低噪音进度心跳**:仅在连续多次轮询无新增、且距离上次心跳已超过阈值时,允许发一条简短确认,默认至少间隔 60 秒,例如“当前进度为：仍在验证阶段,最近一次动作是…”。不要把心跳做成高频刷屏。
 - **若 main 忘了监听,应立即补播最近关键步骤**,然后恢复正常轮询,不要继续静默执行。
 - **若只发了首条提示但没建 wake/等待链路,视为监听未启动**。
 
@@ -268,7 +269,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 1. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", ...)`**。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
 2. **委托后立即进入监听模式**:
    - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
-   - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 **hidden/internal payload** 绑定到当前对话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若 runtime 暂不支持 hidden wake,则只允许使用短 token 文本: `当前进度为：__oc_live__:<watchId>:<lastSeenSeq>:<urlencodedSessionKey>`。
+   - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 **hidden/internal payload** 绑定到当前对话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若 runtime 暂不支持 hidden wake,则可见文本只允许显示 `当前进度`。
    - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
    - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
@@ -298,8 +299,8 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
   `{"kind":"internalWake","watchId":"watch-webgen-<slug>","data":{"targetSessionKey":"agent:webgen:proj-<slug>","lastSeenSeq":1234,"phase":"implementing"}}`
 - wake 回合读取结构化 payload 后,再调用 `sessions_history(...)` 拉新增进展,并向用户输出 1–3 条中文摘要。
 - 不要把 `last_broadcast_seq`、`sessionKey`、轮询提示词写进用户可见消息。
-- fallback token:
-  `当前进度为：__oc_live__:watch-webgen-<slug>:1234:agent%3Awebgen%3Aproj-<slug>`
+- fallback visible text:
+  `当前进度`
 
 ### 边界
 

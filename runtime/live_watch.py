@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from runtime.live_wake_token import looks_like_wake_token
+from runtime.live_wake_token import is_visible_wake_text, looks_like_wake_token
 
 
 @dataclass(eq=True)
@@ -20,6 +20,8 @@ class WatchState:
     last_heartbeat_at: float = 0.0
     idle_poll_count: int = 0
     last_progress_summary: str = ""
+    last_control_event_id: str = ""
+    pending_control_summary: str = ""
 
 
 def _read_state_store(path: Path) -> dict[str, Any]:
@@ -51,6 +53,8 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
         last_heartbeat_at=float(raw.get("last_heartbeat_at", 0.0)),
         idle_poll_count=int(raw.get("idle_poll_count", 0)),
         last_progress_summary=str(raw.get("last_progress_summary", "")),
+        last_control_event_id=str(raw.get("last_control_event_id", "")),
+        pending_control_summary=str(raw.get("pending_control_summary", "")),
     )
 
 
@@ -98,6 +102,8 @@ def single_line(text: str, max_len: int = 140) -> str:
 
 def is_internal_prompt_text(text: str) -> bool:
     lowered = text.lower()
+    if is_visible_wake_text(text):
+        return True
     if text.startswith("[cron:"):
         return True
     if looks_like_wake_token(text):
@@ -256,6 +262,8 @@ def record_cycle_state(state: WatchState, items: list[dict[str, Any]], now: floa
             last_heartbeat_at=state.last_heartbeat_at,
             idle_poll_count=0,
             last_progress_summary=latest_summary,
+            last_control_event_id=state.last_control_event_id,
+            pending_control_summary=state.pending_control_summary,
         )
     return WatchState(
         watch_id=state.watch_id,
@@ -266,6 +274,8 @@ def record_cycle_state(state: WatchState, items: list[dict[str, Any]], now: floa
         last_heartbeat_at=state.last_heartbeat_at,
         idle_poll_count=state.idle_poll_count + 1,
         last_progress_summary=state.last_progress_summary,
+        last_control_event_id=state.last_control_event_id,
+        pending_control_summary=state.pending_control_summary,
     )
 
 
@@ -285,7 +295,7 @@ def maybe_create_heartbeat(
     state: WatchState,
     now: float,
     min_idle_polls: int = 3,
-    min_heartbeat_interval_seconds: float = 75.0,
+    min_heartbeat_interval_seconds: float = 60.0,
 ) -> dict[str, Any] | None:
     if state.phase in {"waiting_user", "blocked", "done", "canceled"}:
         return None
@@ -320,4 +330,75 @@ def record_heartbeat_sent(state: WatchState, now: float) -> WatchState:
         last_heartbeat_at=now,
         idle_poll_count=state.idle_poll_count,
         last_progress_summary=state.last_progress_summary,
+        last_control_event_id=state.last_control_event_id,
+        pending_control_summary=state.pending_control_summary,
     )
+
+
+def record_control_event(state: WatchState, event_id: str, summary: str, phase: str | None = None) -> WatchState:
+    return WatchState(
+        watch_id=state.watch_id,
+        target_session_key=state.target_session_key,
+        last_seen_seq=state.last_seen_seq,
+        last_broadcast_seq=state.last_broadcast_seq,
+        phase=phase or state.phase,
+        last_heartbeat_at=state.last_heartbeat_at,
+        idle_poll_count=state.idle_poll_count,
+        last_progress_summary=state.last_progress_summary,
+        last_control_event_id=event_id,
+        pending_control_summary=summary,
+    )
+
+
+def maybe_take_control_event(state: WatchState) -> tuple[dict[str, Any] | None, WatchState]:
+    if not state.pending_control_summary:
+        return None, state
+    item = {
+        "seq": state.last_broadcast_seq,
+        "kind": "control",
+        "summary": state.pending_control_summary,
+        "sessionKey": state.target_session_key,
+    }
+    updated = WatchState(
+        watch_id=state.watch_id,
+        target_session_key=state.target_session_key,
+        last_seen_seq=state.last_seen_seq,
+        last_broadcast_seq=state.last_broadcast_seq,
+        phase=state.phase,
+        last_heartbeat_at=state.last_heartbeat_at,
+        idle_poll_count=state.idle_poll_count,
+        last_progress_summary=state.last_progress_summary,
+        last_control_event_id=state.last_control_event_id,
+        pending_control_summary="",
+    )
+    return item, updated
+
+
+def build_broadcast_batch(
+    state: WatchState,
+    progress_items: list[dict[str, Any]],
+    now: float,
+    max_items: int = 3,
+    min_idle_polls: int = 3,
+    min_heartbeat_interval_seconds: float = 60.0,
+) -> tuple[list[dict[str, Any]], WatchState]:
+    batch: list[dict[str, Any]] = list(progress_items[:max_items])
+    updated = state
+
+    if len(batch) < max_items:
+        control_item, updated = maybe_take_control_event(updated)
+        if control_item is not None:
+            batch.append(control_item)
+
+    if len(batch) < max_items:
+        heartbeat = maybe_create_heartbeat(
+            updated,
+            now,
+            min_idle_polls=min_idle_polls,
+            min_heartbeat_interval_seconds=min_heartbeat_interval_seconds,
+        )
+        if heartbeat is not None:
+            batch.append(heartbeat)
+            updated = record_heartbeat_sent(updated, now)
+
+    return batch, updated

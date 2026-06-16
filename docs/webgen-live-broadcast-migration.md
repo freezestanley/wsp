@@ -25,7 +25,7 @@
 4. **恢复 runtime 辅助脚本**:方便本地观察、调试、对照 webgen session 增量输出
 5. **弃用可见 announce wake**:不再把自然语言 cron 提示词直接注入当前对话
 
-> 额外修正：旧方案把 `sessionTarget:"current" + agentTurn + delivery.mode:"announce"` 当作回到当前对话的办法，但这会把 `[cron:...]` 和整段内部调度文本泄露到用户对话。新的目标协议改成 **hidden/internal wake + 结构化状态 + wake 回合主动拉取 `sessions_history`**。在当前“外层 runtime 不可改”的约束下,workspace 内 fallback 为 **最小泄露 token**，推荐显示文本为 `当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo`。
+> 额外修正：旧方案把 `sessionTarget:"current" + agentTurn + delivery.mode:"announce"` 当作回到当前对话的办法，但这会把 `[cron:...]` 和整段内部调度文本泄露到用户对话。新的目标协议改成 **hidden/internal wake + 结构化状态 + wake 回合主动拉取 `sessions_history`**。在当前“外层 runtime 不可改”的约束下,workspace 内 fallback 的用户可见文本只显示 `当前进度`。
 
 ---
 
@@ -85,11 +85,11 @@
 
 1. 读取目标 session 的 `sessions_history(..., includeTools=true)`
 2. 只提炼上次之后的新增动作
-3. 翻译成 1–3 条中文直播
+3. 翻译成 1–3 条中文直播；必要时可合并一条关键委托/控制面同步事件
 4. 判断状态:
    - 已交付 → 停播并汇总
    - 明确阻塞 → 停播并向用户转达
-   - 长时间无新增 → 按阈值发一条低噪音进度心跳
+   - 长时间无新增 → 按阈值发一条低噪音进度心跳（默认至少间隔 60 秒）
    - 未结束 → 再安排下一次 wake
 
 ---
@@ -117,17 +117,17 @@ wake 回合拿到该 payload 后,再由 main 主动:
 3. 生成人话摘要
 4. 决定是否继续安排下一次 wake
 
-如果上游 runtime 还不能隐藏 wake 载荷,workspace 内允许的唯一 fallback 是短 token:
+如果上游 runtime 还不能隐藏 wake 载荷,workspace 内允许的唯一 fallback 可见文本是:
 
 ```text
-当前进度为：__oc_live__:watch-webgen-<slug>:1234:agent%3Awebgen%3Aproj-<slug>
+当前进度
 ```
 
 要求:
 
-1. token 必须短且机械,不能含自然语言说明
-2. token 里只允许 `watchId / lastSeenSeq / targetSessionKey`
-3. 本地摘要层必须把这类 token 识别为内部文本并过滤
+1. 可见文本只能是这 4 个字,不能附带 token 与自然语言说明
+2. 本地摘要层必须把这类文本识别为内部 wake 文本并过滤
+3. 旧格式 `当前进度为：__oc_live__...` 仍保留兼容识别,但不再新生成
 
 ---
 
@@ -204,7 +204,7 @@ wake 回合拿到该 payload 后,再由 main 主动:
    - 后续继续播报而不是只播一次
    - 且续播发生在**当前用户对话**,不是独立 cron session
    - 且用户看不到 `[cron:...]` 或 `【继续监听任务】...`
-   - 若外层 runtime 仍会回显 wake 文本,也只能看到短 token,不能看到自然语言调度说明
+   - 若外层 runtime 仍会回显 wake 文本,也只能看到 `当前进度`,不能看到自然语言调度说明
 
 ### 方案 B：规则 + 调试工具一起迁（推荐）
 
@@ -235,7 +235,7 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 4. **任务没结束就会继续 wake**
 5. **直到交付/阻塞才停播**
 6. **用户对话里不出现内部 cron / wake 提示词**
-7. **若外层 runtime 不可改,最多只出现短 token,不会出现整段调度说明**
+7. **若外层 runtime 不可改,最多只出现“当前进度”,不会出现 token 与整段调度说明**
 
 如果只做到“委托 + 第一条消息”,或 wake 后只在独立 cron session 里自转、没有回到当前用户对话,或用户仍能看到 `[cron:...]` / 自然语言 wake prompt,仍然算未迁移完成。
 
@@ -269,5 +269,5 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 
 在这三项完成前,workspace 当前方案的最好效果是:
 
-- 把泄露从“大段自然语言 cron 指令”收敛成“短 token”
+- 把泄露从“大段自然语言 cron 指令”收敛成“当前进度”
 - 把真实播报完全交给本地摘要层二次生成

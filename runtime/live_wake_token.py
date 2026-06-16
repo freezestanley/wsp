@@ -4,7 +4,8 @@ from __future__ import annotations
 from urllib.parse import quote, unquote
 
 TOKEN_PREFIX = "__oc_live__"
-VISIBLE_PREFIX = "当前进度为："
+VISIBLE_TEXT = "当前进度"
+LEGACY_VISIBLE_PREFIX = "当前进度为："
 
 
 def encode_wake_token(watch_id: str, target_session_key: str, last_seen_seq: int) -> str:
@@ -13,12 +14,12 @@ def encode_wake_token(watch_id: str, target_session_key: str, last_seen_seq: int
 
 
 def format_visible_wake_text(watch_id: str, target_session_key: str, last_seen_seq: int) -> str:
-    return f"{VISIBLE_PREFIX}{encode_wake_token(watch_id, target_session_key, last_seen_seq)}"
+    return VISIBLE_TEXT
 
 
 def strip_visible_prefix(text: str) -> str:
-    if text.startswith(VISIBLE_PREFIX):
-        return text[len(VISIBLE_PREFIX) :].strip()
+    if text.startswith(LEGACY_VISIBLE_PREFIX):
+        return text[len(LEGACY_VISIBLE_PREFIX) :].strip()
     return text
 
 
@@ -36,3 +37,7 @@ def decode_wake_token(token: str) -> dict[str, object]:
 
 def looks_like_wake_token(text: str) -> bool:
     return strip_visible_prefix(text).startswith(f"{TOKEN_PREFIX}:")
+
+
+def is_visible_wake_text(text: str) -> bool:
+    return text.strip() == VISIBLE_TEXT

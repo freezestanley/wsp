@@ -4,7 +4,10 @@ from pathlib import Path
 
 from runtime.live_watch import (
     WatchState,
+    build_broadcast_batch,
     maybe_create_heartbeat,
+    maybe_take_control_event,
+    record_control_event,
     record_cycle_state,
     is_internal_prompt_text,
     load_watch_state,
@@ -29,6 +32,8 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(state.last_broadcast_seq, -1)
         self.assertEqual(state.last_heartbeat_at, 0.0)
         self.assertEqual(state.idle_poll_count, 0)
+        self.assertEqual(state.last_control_event_id, "")
+        self.assertEqual(state.pending_control_summary, "")
 
     def test_save_then_load_round_trips_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -56,6 +61,7 @@ class LiveWatchTests(unittest.TestCase):
             is_internal_prompt_text("【继续直播任务】session=agent:webgen:proj-demo; last_broadcast_seq=12")
         )
         self.assertTrue(is_internal_prompt_text("__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo"))
+        self.assertTrue(is_internal_prompt_text("当前进度"))
         self.assertTrue(
             is_internal_prompt_text("当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo")
         )
@@ -81,9 +87,11 @@ class LiveWatchTests(unittest.TestCase):
             last_seen_seq=42,
         )
 
-        payload = decode_wake_token(text)
+        self.assertEqual(text, "当前进度")
 
-        self.assertEqual(text, "当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo")
+    def test_legacy_visible_wake_text_still_decodes(self) -> None:
+        payload = decode_wake_token("当前进度为：__oc_live__:watch-webgen-demo:42:agent%3Awebgen%3Aproj-demo")
+
         self.assertEqual(payload["watch_id"], "watch-webgen-demo")
         self.assertEqual(payload["target_session_key"], "agent:webgen:proj-demo")
         self.assertEqual(payload["last_seen_seq"], 42)
@@ -107,7 +115,7 @@ class LiveWatchTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": "当前进度为：__oc_live__:watch-webgen-demo:9:agent%3Awebgen%3Aproj-demo"}],
+                "content": [{"type": "text", "text": "当前进度"}],
                 "__openclaw": {"seq": 10},
             },
             {
@@ -244,6 +252,93 @@ class LiveWatchTests(unittest.TestCase):
         )
 
         self.assertIsNone(heartbeat)
+
+    def test_record_control_event_stores_pending_summary(self) -> None:
+        state = WatchState(
+            watch_id="watch-8",
+            target_session_key="agent:webgen:proj-demo",
+        )
+
+        updated = record_control_event(
+            state,
+            event_id="evt-1",
+            summary="已把你的确认同步给 webgen，继续实现中。",
+            phase="implementing",
+        )
+
+        self.assertEqual(updated.last_control_event_id, "evt-1")
+        self.assertEqual(updated.pending_control_summary, "已把你的确认同步给 webgen，继续实现中。")
+        self.assertEqual(updated.phase, "implementing")
+
+    def test_maybe_take_control_event_returns_once(self) -> None:
+        state = WatchState(
+            watch_id="watch-9",
+            target_session_key="agent:webgen:proj-demo",
+            last_control_event_id="evt-2",
+            pending_control_summary="已收到用户答复并回传给 webgen。",
+        )
+
+        item, updated = maybe_take_control_event(state)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "control")
+        self.assertEqual(item["summary"], "已收到用户答复并回传给 webgen。")
+        self.assertEqual(updated.pending_control_summary, "")
+
+        second_item, second_updated = maybe_take_control_event(updated)
+        self.assertIsNone(second_item)
+        self.assertEqual(second_updated.pending_control_summary, "")
+
+    def test_build_broadcast_batch_prioritizes_progress_over_control_and_heartbeat(self) -> None:
+        state = WatchState(
+            watch_id="watch-10",
+            target_session_key="agent:webgen:proj-demo",
+            phase="verifying",
+            idle_poll_count=4,
+            last_progress_summary="✅ 构建成功：vite build",
+            pending_control_summary="已把你的确认同步给 webgen，继续实现中。",
+            last_control_event_id="evt-3",
+        )
+        progress_items = [
+            {"seq": 12, "kind": "tool", "summary": "✅ 构建成功：vite build", "sessionKey": "agent:webgen:proj-demo"},
+            {"seq": 13, "kind": "assistant", "summary": "💬 已完成首版实现，正在截图验证", "sessionKey": "agent:webgen:proj-demo"},
+        ]
+
+        batch, updated = build_broadcast_batch(
+            state,
+            progress_items,
+            now=120.0,
+            max_items=3,
+            min_idle_polls=3,
+            min_heartbeat_interval_seconds=60.0,
+        )
+
+        self.assertEqual([item["kind"] for item in batch], ["tool", "assistant", "control"])
+        self.assertEqual(updated.pending_control_summary, "")
+        self.assertEqual(updated.last_heartbeat_at, 0.0)
+
+    def test_build_broadcast_batch_uses_heartbeat_when_idle_and_no_progress_or_control(self) -> None:
+        state = WatchState(
+            watch_id="watch-11",
+            target_session_key="agent:webgen:proj-demo",
+            phase="verifying",
+            idle_poll_count=4,
+            last_progress_summary="✅ 构建成功：vite build",
+        )
+
+        batch, updated = build_broadcast_batch(
+            state,
+            [],
+            now=120.0,
+            max_items=3,
+            min_idle_polls=3,
+            min_heartbeat_interval_seconds=60.0,
+        )
+
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0]["kind"], "heartbeat")
+        self.assertGreater(updated.last_heartbeat_at, 0.0)
 
 
 if __name__ == "__main__":
