@@ -21,6 +21,7 @@ from runtime.live_watch import (
     save_watch_state,
     summarize_new_messages,
 )
+from runtime.context_stopgap import truncate_tool_output
 
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
 
@@ -130,10 +131,17 @@ def main() -> int:
     last_seen = args.since_seq if args.since_seq is not None else watch_state.last_seen_seq
 
     if args.control_event_id and args.control_summary:
+        bounded_control = truncate_tool_output(
+            args.control_summary,
+            max_lines=4,
+            max_bytes=280,
+            head_lines=3,
+            tail_lines=1,
+        )
         watch_state = record_control_event(
             watch_state,
             event_id=args.control_event_id,
-            summary=args.control_summary,
+            summary=str(bounded_control['text']),
             phase=args.control_phase,
         )
 

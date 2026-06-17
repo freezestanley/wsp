@@ -9,6 +9,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from runtime.context_stopgap import summarize_tool_payload
+
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
 
 
@@ -95,6 +100,13 @@ def flatten_content(msg: dict[str, Any]) -> str:
 def format_message(msg: dict[str, Any], seq: int) -> str:
     role = msg.get('role', 'unknown')
     text = flatten_content(msg)
+    tool_name = msg.get('toolName')
+    if role == 'toolResult' and tool_name:
+        payload = summarize_tool_payload(tool_name, text)
+        if payload['summarized'] or payload['truncation']['truncated']:
+            text = f"{payload['summary']}\n{payload['text']}"
+        else:
+            text = str(payload['text'])
     if not text:
         text = '(empty)'
     return f'[{seq}] {role}: {text}'

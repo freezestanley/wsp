@@ -66,6 +66,37 @@
 
 ---
 
+## Context Stopgap 边界
+
+这层 stopgap 只负责**减少 transcript 增长**,不负责改变项目恢复语义。明确边界如下:
+
+- 不改 `slug -> sessionKey` 绑定
+- 不改 deterministic resume 流程
+- 不改 single active project session 语义
+- 不引入 session rollover / 临时换绑来“绕过”高上下文
+
+workspace 层当前建议的阈值策略:
+
+- `<120k`：`ok`
+- `>=120k`：`warn`
+- `>=140k`：`compact`
+- `>=160k`：`hard-stop`
+
+含义:
+
+- 到 `warn` 以后,Discovery 就不该再继续整段 dump 文件内容
+- 到 `compact` 以前,上游 runtime 应该已经触发压缩
+- 到 `hard-stop` 时,上游 runtime 应拒绝继续增长超长 transcript,但仍保持原有 project/session identity 不变
+
+为配合这套 stopgap,Discovery 侧应优先:
+
+- `rg -n` 定位所需字段
+- `sed -n` 读取窄窗口
+- 对 `DISCOVERY.md` 只抽取结构化字段,不要整份回显
+- 对 `read` / `exec` 的超长结果只保留头尾片段
+
+---
+
 ## main 侧标准流程
 
 ### 委托当回合

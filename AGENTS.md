@@ -253,7 +253,21 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 `sessions_send(agentId="webgen", ...)` **永远只路由到 `agent:webgen:main`**,而该 session 会被 webgen 自己的 SO-002(单项目锁定)锁在某个旧项目上,新项目在那写不了 → 它把任务包弹回 main → main 再走 agentId → **无限 ping-pong 死结**(已踩坑实测)。
 
+### 老项目修改:先做确定性 resume 预检
+
+- 当用户明确是在**修改老项目**，并且消息里**确定性**出现以下任一标识时，main 在创建新 session 前**必须优先复用旧项目 session**，不要先开新 session 再让 webgen 自己回找：
+- `projects/<slug>`
+- 明确的 `slug`（如 `slug: gshock-site`、`slug=gshock-site`，或消息里直接出现已存在的精确 slug `gshock-site`）
+- **唯一可映射**到现有项目的明确项目名（exact project name）
+- 预检入口：`python3 runtime/webgen_resume_resolver.py --stdin`
+- 预检命中后会得到 `matched=true`、`slug=<slug>`、`sessionKey=agent:webgen:proj-<slug>`、`mode=resume:<slug>` 等结果；这时 **必须**直接用返回的 `sessionKey` 委托，**禁止**先 `sessions_send(agentId="webgen", ...)` 再跳转。
+- 若预检结果为 `matched=false`：
+- `reason=no-deterministic-project-match`：说明用户没给够确定性标识，可按正常澄清 / 新项目流继续。
+- `reason=ambiguous-deterministic-project-match`：说明命中了多个旧项目，先向用户澄清到底是哪一个，再委托。
+- 这条预检只处理**确定性复用**，不做模糊猜测，不做“可能是上次那个项目”的推断。
+
 **正确做法**:
+- **老项目且已命中确定性 resume 预检**:直接用 resolver 返回的 `sessionKey` 委托，按 `mode=resume:<slug>` 继续，监听也直接跟这个 sessionKey。
 - **澄清/Discovery 阶段**(只问问题、不写文件):可以走 `agentId="webgen"` 让 main session 帮忙整理澄清清单。
 - **一旦确认要落地新项目**:**必须**改用独立 sessionKey 委托:`sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`。`<slug>` 用项目英文短名(如 `user-list-table`)。该 sessionKey 是全新无锁 session,webgen 会在那写 lock、做 Discovery、实现、CDP 验证、交付,不会撞锁。
 - 监听时拉的也是这个独立 sessionKey 的 history,不是 `agent:webgen:main`。
@@ -266,18 +280,19 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - 若需要补充 main 自己整理的约束、假设或背景,必须明确标注为“附加说明”或等价标签,不得与用户原文混写成一段,避免让 webgen误以为这些也是用户原话。
 - 若用户输入很短、很模糊、甚至只有一句话,也仍然必须先逐字转发该原话,再另行补充调度说明。
 
-1. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", ...)`**。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
-2. **委托后立即进入监听模式**:
+1. 先判断这是不是老项目修改；如果用户消息里已确定性给出 `projects/<slug>` / 明确 `slug` / 唯一精确项目名,先跑 `python3 runtime/webgen_resume_resolver.py --stdin` 做 resume 预检。命中则直接拿返回的 `sessionKey` 走 `resume:<slug>` 委托与监听,**不要**先经过 `agent:webgen:main`。
+2. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`**。若第 1 步命中老项目 resume,则这里的 `sessionKey` 必须使用 resolver 返回值。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
+3. **委托后立即进入监听模式**:
    - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
    - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 **hidden/internal payload** 绑定到当前对话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若 runtime 暂不支持 hidden wake,则可见文本只允许显示 `当前进度`。
    - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
    - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
    - 只播**新增**步骤,不重复已播过的;用简短中文,不贴大段原始日志。`watchId -> targetSessionKey -> lastBroadcastSeq` 必须有可恢复的持久状态,不能只靠 prompt 文本记忆。
-3. webgen 若**反问澄清**,把问题原样转达用户;用户答复后回传 webgen。
-4. webgen **交付后**,用 main 自己口吻汇总:改了哪些文件、文件在哪、如何预览、blocker/剩余风险。
-5. 若 wake 回合里发现任务**尚未交付也未阻塞**,必须再次 `cron.add` / `cron.update` 安排下一次 wake,形成连续监听链。
-6. 直到 webgen 明确交付、明确阻塞且需要用户决策,或任务被取消,才停止监听轮询。
+4. webgen 若**反问澄清**,把问题原样转达用户;用户答复后回传 webgen。
+5. webgen **交付后**,用 main 自己口吻汇总:改了哪些文件、文件在哪、如何预览、blocker/剩余风险。
+6. 若 wake 回合里发现任务**尚未交付也未阻塞**,必须再次 `cron.add` / `cron.update` 安排下一次 wake,形成连续监听链。
+7. 直到 webgen 明确交付、明确阻塞且需要用户决策,或任务被取消,才停止监听轮询。
 
 ### 为什么这里不用可见 `current-session announce`
 
