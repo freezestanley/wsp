@@ -34,6 +34,9 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(state.idle_poll_count, 0)
         self.assertEqual(state.last_control_event_id, "")
         self.assertEqual(state.pending_control_summary, "")
+        self.assertEqual(state.last_context_band, "ok")
+        self.assertEqual(state.last_context_nudge_at, 0.0)
+        self.assertFalse(state.awaiting_context_ack)
 
     def test_save_then_load_round_trips_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -44,12 +47,37 @@ class LiveWatchTests(unittest.TestCase):
                 last_seen_seq=41,
                 last_broadcast_seq=39,
                 phase="implementing",
+                last_context_band="compact",
+                last_context_nudge_at=123.0,
+                awaiting_context_ack=True,
             )
 
             save_watch_state(path, original)
             loaded = load_watch_state(path, "watch-2")
 
         self.assertEqual(loaded, original)
+
+    def test_record_cycle_state_preserves_context_fields(self) -> None:
+        state = WatchState(
+            watch_id="watch-2b",
+            target_session_key="agent:webgen:proj-ops",
+            last_seen_seq=41,
+            last_broadcast_seq=39,
+            phase="implementing",
+            last_context_band="warn",
+            last_context_nudge_at=123.0,
+            awaiting_context_ack=True,
+        )
+
+        updated = record_cycle_state(
+            state,
+            [{"seq": 42, "summary": "✅ 构建成功：vite build"}],
+            now=130.0,
+        )
+
+        self.assertEqual(updated.last_context_band, "warn")
+        self.assertEqual(updated.last_context_nudge_at, 123.0)
+        self.assertTrue(updated.awaiting_context_ack)
 
     def test_internal_prompt_text_is_detected(self) -> None:
         self.assertTrue(

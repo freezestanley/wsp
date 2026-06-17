@@ -3,11 +3,13 @@ import unittest
 try:
     from runtime.context_stopgap import (
         compaction_band,
+        compaction_band_for_ratio,
         summarize_tool_payload,
         truncate_tool_output,
     )
 except ImportError:
     compaction_band = None
+    compaction_band_for_ratio = None
     summarize_tool_payload = None
     truncate_tool_output = None
 
@@ -148,6 +150,31 @@ airy
         self.assertEqual(compaction_band(140000), "compact")
         self.assertEqual(compaction_band(159999), "compact")
         self.assertEqual(compaction_band(160000), "hard-stop")
+
+    def test_compaction_band_for_ratio_uses_expected_thresholds(self) -> None:
+        self.assertIsNotNone(compaction_band_for_ratio, "compaction_band_for_ratio must be implemented")
+
+        self.assertEqual(compaction_band_for_ratio(0.0), "ok")
+        self.assertEqual(compaction_band_for_ratio(0.7999), "ok")
+        self.assertEqual(compaction_band_for_ratio(0.80), "warn")
+        self.assertEqual(compaction_band_for_ratio(0.8499), "warn")
+        self.assertEqual(compaction_band_for_ratio(0.85), "compact")
+        self.assertEqual(compaction_band_for_ratio(0.9199), "compact")
+        self.assertEqual(compaction_band_for_ratio(0.92), "force-compact")
+
+    def test_compaction_band_for_ratio_saturates_slight_overshoot_instead_of_treating_it_as_percent(self) -> None:
+        self.assertIsNotNone(compaction_band_for_ratio, "compaction_band_for_ratio must be implemented")
+
+        self.assertEqual(compaction_band_for_ratio(1.01), "force-compact")
+        self.assertEqual(compaction_band_for_ratio(1.2), "force-compact")
+
+    def test_compaction_band_for_ratio_keeps_supporting_percent_style_input(self) -> None:
+        self.assertIsNotNone(compaction_band_for_ratio, "compaction_band_for_ratio must be implemented")
+
+        self.assertEqual(compaction_band_for_ratio(79), "ok")
+        self.assertEqual(compaction_band_for_ratio(80), "warn")
+        self.assertEqual(compaction_band_for_ratio(85), "compact")
+        self.assertEqual(compaction_band_for_ratio(92), "force-compact")
 
 
 if __name__ == "__main__":

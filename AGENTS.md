@@ -216,25 +216,29 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 当用户提出**新建网页/页面/网站/dashboard/落地页/官网**类需求时,不要自己手写单文件 HTML,而是**自动把任务委托给 `webgen` agent**,并**全程逐步监听** webgen 的每一步进度。
 
+## 强制规则
+- 全都用中文
+- 回答总结概括直接说结果
+- 去除日志，tool调用记录，只记录结果
 
 ### 先读技能(强制)
 
 - 一旦进入建站委托 + 监听流程,先读取 `skills/delegated-live-broadcasting/SKILL.md`,按其中的**首条播报 + wake 链续航**规则执行。
-- 不能只靠 AGENTS 里的口头约束理解为“这一回合里手动多查几次 history 就算监听”。
+- 禁止只靠 AGENTS 里的口头约束理解为“这一回合里手动多查几次 history 就算监听”。
 - 只要预期监听会跨回合持续,**默认必须建立 cron wake 链**。
-- 要用自己在完成任务的角度去回复
 
 ### 强制监听约束(不可省略)
 
 - **只要进入建站委托流程,就必须开启监听**;不允许“后台悄悄做完再一次性汇报”。
 - **首次委托后立刻播报**:至少说明已委托给哪个 session、当前处于什么阶段(例如 Discovery / 实现 / 验证)。
-- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 20–40 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 **hidden wake / internal wake** 绑定当前会话,只传结构化状态,**严禁**把自然语言调度提示词通过 `delivery.mode:"announce"` 直接投进对话框;若 runtime 还不支持 hidden wake,可见文本只允许显示 `当前进度` 这 4 个字,不要再发送整段自然语言指令;只有当前回合本来就会持续挂起等待时,才可不用 wake。
+- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 30 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 **hidden wake / internal wake** 绑定当前会话,只传结构化状态,**严禁**把自然语言调度提示词通过 `delivery.mode:"announce"` 直接投进对话框;若 runtime 还不支持 hidden wake,可见文本只允许显示 `当前进度` 这 4 个字,不要再发送整段自然语言指令;只有当前回合本来就会持续挂起等待时,才可不用 wake。
 - **监听必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
-- **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译成人话同步给用户,不能只在最后做总结。
+- **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译并总结成人话同步给用户,禁止只在最后做总结。
 - **委托同步也可播报**:例如“已把你的确认同步给 webgen”“已收到用户答复并回传给 webgen”。但这类控制面同步的优先级低于真实执行新增,不要让委托消息淹没实际进度。
-- **禁止伪监听**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作播报。
+- **禁止伪监听**:不能只说“处理中 / 稍等”;必须基于实际 session history 中的新增动作总结播报。
 - **若长时间无更新,保持静默即可**;但一旦出现新步骤,应在下一次轮询时继续监听。
 - **若长时间无更新,可发低噪音进度心跳**:仅在连续多次轮询无新增、且距离上次心跳已超过阈值时,允许发一条简短确认,默认至少间隔 60 秒,例如“当前进度为：仍在验证阶段,最近一次动作是…”。不要把心跳做成高频刷屏。
+- **watcher 可做静默 context 干预,但不能冒泡给用户**:若当前轮询拿到了 context usage ratio,可在内部计算 `ok / warn / compact / force-compact` band,并按 band 升级规划 silent context nudge,提醒 webgen 先自检 context、必要时 `/compact` 后继续;若本轮没有 ratio,watcher 行为保持不变。该 silent nudge 只允许作为内部控制面动作,**禁止**单独生成用户可见的“当前进度”或其他播报。
 - **若 main 忘了监听,应立即补播最近关键步骤**,然后恢复正常轮询,不要继续静默执行。
 - **若只发了首条提示但没建 wake/等待链路,视为监听未启动**。
 
@@ -269,7 +273,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 **正确做法**:
 - **老项目且已命中确定性 resume 预检**:直接用 resolver 返回的 `sessionKey` 委托，按 `mode=resume:<slug>` 继续，监听也直接跟这个 sessionKey。
 - **澄清/Discovery 阶段**(只问问题、不写文件):可以走 `agentId="webgen"` 让 main session 帮忙整理澄清清单。
-- **一旦确认要落地新项目**:**必须**改用独立 sessionKey 委托:`sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`。`<slug>` 用项目英文短名(如 `user-list-table`)。该 sessionKey 是全新无锁 session,webgen 会在那写 lock、做 Discovery、实现、CDP 验证、交付,不会撞锁。
+- **一旦确认要落地新项目**:**必须**改用独立 sessionKey 委托:`sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`。`<slug>` 用项目英文短名(如 `user-list-table`)。该 sessionKey 是全新无锁 session,webgen 会在那写 lock、做 Discovery、实现、验证、交付,不会撞锁。
 - 监听时拉的也是这个独立 sessionKey 的 history,不是 `agent:webgen:main`。
 - 若 `agent:webgen:main` 反复弹回"请 main 分配独立 session"的任务包,**别再回它**,直接按上面用 `agent:webgen:proj-<slug>` 开新 session 落地。
 
@@ -286,6 +290,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
    - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
    - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 **hidden/internal payload** 绑定到当前对话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若 runtime 暂不支持 hidden wake,则可见文本只允许显示 `当前进度`。
    - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
+   - 若 wake 回合还能拿到 context usage ratio,可额外走一条**静默** context nudge 决策路径:内部算 band,必要时规划 silent nudge;但这条路径只更新 watcher 内部状态/控制动作,**不能**因此单独产出用户可见进度。若拿不到 ratio,按原监听逻辑继续即可。
    - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
    - 只播**新增**步骤,不重复已播过的;用简短中文,不贴大段原始日志。`watchId -> targetSessionKey -> lastBroadcastSeq` 必须有可恢复的持久状态,不能只靠 prompt 文本记忆。
@@ -300,6 +305,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - 旧做法里,`sessionTarget:"current" + payload.kind:"agentTurn" + delivery.mode:"announce"` 会把原始 cron 提示词编进当前对话上下文,导致用户直接看到 `[cron:...]` 与整段调度指令。
 - 所以,凡是目标是“继续在当前用户对话里监听”,默认都应改用 **hidden/internal wake**:唤醒事件只注入结构化状态,对话框里只显示 wake 回合重新生成的人话摘要。
 - 如果 runtime 尚未支持 hidden wake,则视为**协议未就绪**;不要回退到会泄露内部提示词的可见 announce。
+- 同理,真正的 hidden `sessions_send` 控制投递以及 `[cron:...]` / `Current time` / `Reference UTC` 的系统包裹抑制,仍依赖上游 runtime;workspace 当前只允许先把 silent context nudge 规划成内部动作,不宣称这些 runtime 能力已经完工。
 
 ### 监听节流(避免刷屏 / 空轮询)
 
@@ -312,8 +318,8 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 - 推荐 payload:
   `{"kind":"internalWake","watchId":"watch-webgen-<slug>","data":{"targetSessionKey":"agent:webgen:proj-<slug>","lastSeenSeq":1234,"phase":"implementing"}}`
-- wake 回合读取结构化 payload 后,再调用 `sessions_history(...)` 拉新增进展,并向用户输出 1–3 条中文摘要。
-- 不要把 `last_broadcast_seq`、`sessionKey`、轮询提示词写进用户可见消息。
+- wake 回合读取结构化 payload 后,再调用 `sessions_history(...)` 拉新增进展,并向用户输出 1 条中文摘要。
+- 禁止把 `last_broadcast_seq`、`sessionKey`、轮询提示词写进用户可见消息。
 - fallback visible text:
   `当前进度`
 
@@ -323,6 +329,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - 委托是默认行为,用户可随时说「这个你自己做」覆盖。
 - webgen 的 session key 约定为 `agent:webgen:main`(首条 sessions_send 会自动创建)。
 - 前提开关:`tools.agentToAgent.enabled=true` 且 `tools.sessions.visibility=all`,否则跨 agent 委托会被拒。
+- deterministic resume、`slug -> sessionKey` 绑定、当前项目 session identity 均保持不变;silent context nudge 不能借机切新 session、换绑旧项目,也不能改变既有 resume 语义。
 
 ## Make It Yours
 

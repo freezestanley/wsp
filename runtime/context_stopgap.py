@@ -102,3 +102,29 @@ def compaction_band(context_size: int) -> str:
     if context_size >= 120000:
         return "warn"
     return "ok"
+
+
+def _normalize_context_ratio(used_ratio: float) -> float:
+    ratio = float(used_ratio)
+    if ratio < 0.0:
+        return 0.0
+    if ratio <= 1.0:
+        return ratio
+    if ratio < 2.0:
+        return 1.0
+    if ratio <= 100.0:
+        ratio = ratio / 100.0
+    if ratio > 1.0:
+        return 1.0
+    return ratio
+
+
+def compaction_band_for_ratio(used_ratio: float) -> str:
+    ratio = _normalize_context_ratio(used_ratio)
+    if ratio >= 0.92:
+        return "force-compact"
+    if ratio >= 0.85:
+        return "compact"
+    if ratio >= 0.80:
+        return "warn"
+    return "ok"

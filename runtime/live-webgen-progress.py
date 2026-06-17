@@ -6,8 +6,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,6 +22,8 @@ from runtime.live_watch import (
     save_watch_state,
     summarize_new_messages,
 )
+from runtime.context_nudge import clear_context_ack, maybe_plan_hidden_context_nudge
+from runtime.context_stopgap import compaction_band_for_ratio
 from runtime.context_stopgap import truncate_tool_output
 
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
@@ -100,6 +103,64 @@ def print_intro(session_key: str, interval: float) -> None:
     print(f'📡 开始直播｜session={session_key}｜每 {interval:g} 秒轮询｜输出新增关键步骤 + assistant 进展', flush=True)
 
 
+def normalize_context_usage_ratio(raw_ratio: float | None) -> float | None:
+    if raw_ratio is None:
+        return None
+    ratio = float(raw_ratio)
+    if not isfinite(ratio):
+        raise ValueError('context usage ratio must be finite')
+    if ratio < 0.0:
+        return 0.0
+    if ratio <= 1.0:
+        return ratio
+    if ratio < 2.0:
+        raise ValueError('context usage ratio in (1, 2) is ambiguous; use 0..1 or 2..100 percentage form')
+    if ratio <= 100.0:
+        return ratio / 100.0
+    return 1.0
+
+
+def sanitize_context_nudge_cooldown_seconds(raw_cooldown: float) -> float:
+    cooldown = float(raw_cooldown)
+    if not isfinite(cooldown) or cooldown <= 0.0:
+        return 1.0
+    return cooldown
+
+
+def emit_batch(batch: list[dict[str, Any]], *, jsonl: bool, stream: TextIO) -> None:
+    for item in batch:
+        if jsonl:
+            stream.write(json.dumps(item, ensure_ascii=False) + '\n')
+            continue
+        if item.get("seq") is not None and item["kind"] in {"tool", "assistant"}:
+            stream.write(f'[{item["seq"]}] {item["summary"]}\n')
+        else:
+            stream.write(f'{item["summary"]}\n')
+    stream.flush()
+
+
+def evaluate_silent_context_nudge_cycle(
+    state: WatchState,
+    *,
+    items: list[dict[str, Any]],
+    now: float,
+    context_usage_ratio: float | None,
+    cooldown_seconds: float = 300.0,
+) -> tuple[dict[str, Any] | None, WatchState]:
+    if context_usage_ratio is None:
+        return None, state
+
+    updated = clear_context_ack(state, items)
+    normalized_ratio = normalize_context_usage_ratio(context_usage_ratio)
+    context_band = compaction_band_for_ratio(normalized_ratio)
+    return maybe_plan_hidden_context_nudge(
+        updated,
+        context_band=context_band,
+        now=now,
+        cooldown_seconds=sanitize_context_nudge_cooldown_seconds(cooldown_seconds),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='面向 webgen 建站委托的 session 直播摘要器')
     parser.add_argument('session_key', help='例如 agent:webgen:main 或 agent:webgen:proj-user-list-table')
@@ -117,7 +178,11 @@ def main() -> int:
     parser.add_argument('--control-event-id', help='可选：注入一条委托/控制面同步事件 id')
     parser.add_argument('--control-summary', help='可选：注入一条委托/控制面同步事件摘要')
     parser.add_argument('--control-phase', help='可选：注入控制面事件后的阶段标记')
+    parser.add_argument('--context-usage-ratio', type=float, default=None, help='可选：注入本轮 context 使用率，0..1 或百分比')
+    parser.add_argument('--context-nudge-cooldown-seconds', type=float, default=300.0, help='silent context nudge 的最小重试间隔秒数，默认 300')
     args = parser.parse_args()
+    context_usage_ratio = normalize_context_usage_ratio(args.context_usage_ratio)
+    context_nudge_cooldown_seconds = sanitize_context_nudge_cooldown_seconds(args.context_nudge_cooldown_seconds)
 
     cfg = load_config()
     url, headers = gateway_endpoint(cfg)
@@ -168,6 +233,13 @@ def main() -> int:
             watch_state.target_session_key = current_session_key
             watch_state.last_seen_seq = last_seen
             watch_state = record_cycle_state(watch_state, items, now)
+            _silent_nudge, watch_state = evaluate_silent_context_nudge_cycle(
+                watch_state,
+                items=items,
+                now=now,
+                context_usage_ratio=context_usage_ratio,
+                cooldown_seconds=context_nudge_cooldown_seconds,
+            )
             batch, watch_state = build_broadcast_batch(
                 watch_state,
                 items,
@@ -176,14 +248,7 @@ def main() -> int:
                 min_idle_polls=args.heartbeat_idle_polls,
                 min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
             )
-            for item in batch:
-                if args.jsonl:
-                    print(json.dumps(item, ensure_ascii=False), flush=True)
-                else:
-                    if item.get("seq") is not None and item["kind"] in {"tool", "assistant"}:
-                        print(f'[{item["seq"]}] {item["summary"]}', flush=True)
-                    else:
-                        print(item["summary"], flush=True)
+            emit_batch(batch, jsonl=args.jsonl, stream=sys.stdout)
             if state_path:
                 save_watch_state(state_path, watch_state)
         except KeyboardInterrupt:

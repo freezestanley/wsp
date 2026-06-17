@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,13 @@ class WatchState:
     last_progress_summary: str = ""
     last_control_event_id: str = ""
     pending_control_summary: str = ""
+    last_context_band: str = "ok"
+    last_context_nudge_at: float = 0.0
+    awaiting_context_ack: bool = False
+
+
+def _replace_state(state: WatchState, **changes: Any) -> WatchState:
+    return replace(state, **changes)
 
 
 def _read_state_store(path: Path) -> dict[str, Any]:
@@ -55,6 +62,9 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
         last_progress_summary=str(raw.get("last_progress_summary", "")),
         last_control_event_id=str(raw.get("last_control_event_id", "")),
         pending_control_summary=str(raw.get("pending_control_summary", "")),
+        last_context_band=str(raw.get("last_context_band", "ok")),
+        last_context_nudge_at=float(raw.get("last_context_nudge_at", 0.0)),
+        awaiting_context_ack=bool(raw.get("awaiting_context_ack", False)),
     )
 
 
@@ -264,29 +274,16 @@ def record_cycle_state(state: WatchState, items: list[dict[str, Any]], now: floa
     if items:
         latest = items[-1]
         latest_summary = str(latest.get("summary", ""))
-        return WatchState(
-            watch_id=state.watch_id,
-            target_session_key=state.target_session_key,
-            last_seen_seq=state.last_seen_seq,
+        return _replace_state(
+            state,
             last_broadcast_seq=int(latest.get("seq", state.last_broadcast_seq)),
             phase=infer_phase_from_summary(latest_summary, state.phase),
-            last_heartbeat_at=state.last_heartbeat_at,
             idle_poll_count=0,
             last_progress_summary=latest_summary,
-            last_control_event_id=state.last_control_event_id,
-            pending_control_summary=state.pending_control_summary,
         )
-    return WatchState(
-        watch_id=state.watch_id,
-        target_session_key=state.target_session_key,
-        last_seen_seq=state.last_seen_seq,
-        last_broadcast_seq=state.last_broadcast_seq,
-        phase=state.phase,
-        last_heartbeat_at=state.last_heartbeat_at,
+    return _replace_state(
+        state,
         idle_poll_count=state.idle_poll_count + 1,
-        last_progress_summary=state.last_progress_summary,
-        last_control_event_id=state.last_control_event_id,
-        pending_control_summary=state.pending_control_summary,
     )
 
 
@@ -332,30 +329,16 @@ def maybe_create_heartbeat(
 
 
 def record_heartbeat_sent(state: WatchState, now: float) -> WatchState:
-    return WatchState(
-        watch_id=state.watch_id,
-        target_session_key=state.target_session_key,
-        last_seen_seq=state.last_seen_seq,
-        last_broadcast_seq=state.last_broadcast_seq,
-        phase=state.phase,
+    return _replace_state(
+        state,
         last_heartbeat_at=now,
-        idle_poll_count=state.idle_poll_count,
-        last_progress_summary=state.last_progress_summary,
-        last_control_event_id=state.last_control_event_id,
-        pending_control_summary=state.pending_control_summary,
     )
 
 
 def record_control_event(state: WatchState, event_id: str, summary: str, phase: str | None = None) -> WatchState:
-    return WatchState(
-        watch_id=state.watch_id,
-        target_session_key=state.target_session_key,
-        last_seen_seq=state.last_seen_seq,
-        last_broadcast_seq=state.last_broadcast_seq,
+    return _replace_state(
+        state,
         phase=phase or state.phase,
-        last_heartbeat_at=state.last_heartbeat_at,
-        idle_poll_count=state.idle_poll_count,
-        last_progress_summary=state.last_progress_summary,
         last_control_event_id=event_id,
         pending_control_summary=summary,
     )
@@ -370,16 +353,8 @@ def maybe_take_control_event(state: WatchState) -> tuple[dict[str, Any] | None, 
         "summary": state.pending_control_summary,
         "sessionKey": state.target_session_key,
     }
-    updated = WatchState(
-        watch_id=state.watch_id,
-        target_session_key=state.target_session_key,
-        last_seen_seq=state.last_seen_seq,
-        last_broadcast_seq=state.last_broadcast_seq,
-        phase=state.phase,
-        last_heartbeat_at=state.last_heartbeat_at,
-        idle_poll_count=state.idle_poll_count,
-        last_progress_summary=state.last_progress_summary,
-        last_control_event_id=state.last_control_event_id,
+    updated = _replace_state(
+        state,
         pending_control_summary="",
     )
     return item, updated

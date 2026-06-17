@@ -27,6 +27,8 @@
 
 > 额外修正：旧方案把 `sessionTarget:"current" + agentTurn + delivery.mode:"announce"` 当作回到当前对话的办法，但这会把 `[cron:...]` 和整段内部调度文本泄露到用户对话。新的目标协议改成 **hidden/internal wake + 结构化状态 + wake 回合主动拉取 `sessions_history`**。在当前“外层 runtime 不可改”的约束下,workspace 内 fallback 的用户可见文本只显示 `当前进度`。
 
+> 当前 workspace 还额外接入了一条 **silent context nudge 决策路径**：当 watcher 能拿到 context usage ratio 时,可在 wake 周期里内部计算 `ok / warn / compact / force-compact` band,并规划 silent nudge;当拿不到 ratio 时,watcher 行为保持不变。这条路径目前只影响 watcher 内部状态与控制决策,**不会**单独产出用户可见进度消息。
+
 ---
 
 ## 当前推荐架构
@@ -52,7 +54,7 @@
   - 形成跨回合的直播链
 - `runtime/live_watch.py`
   - 负责本地 watch 状态持久化
-  - 负责增量摘要与内部调度文本过滤
+  - 负责增量摘要、内部调度文本过滤,以及 silent context nudge 相关状态
 - `runtime/live_wake_token.py`
   - 负责生成/解析最小泄露 wake token
 
@@ -61,6 +63,7 @@
 - `runtime/live-webgen-progress.py`
   - 面向人类调试的直播摘要器
   - 可自动把 `toolResult` / `assistant` 进展转成中文摘要
+  - 若提供 context usage ratio,可额外做 silent context nudge 决策;若不提供,行为与原先一致
 - `runtime/watch-session-history.py`
   - 面向底层排查的原始 history 观察器
 
@@ -88,6 +91,12 @@ workspace 层当前建议的阈值策略:
 - 到 `compact` 以前,上游 runtime 应该已经触发压缩
 - 到 `hard-stop` 时,上游 runtime 应拒绝继续增长超长 transcript,但仍保持原有 project/session identity 不变
 
+补充说明:
+
+- 现在 watcher 侧已经能在拿到 ratio 时内部算出 `warn / compact / force-compact`
+- 但这只是“是否需要 silent nudge”的 stopgap 决策,不是 runtime 已经完成 hidden 压缩投递
+- deterministic resume、`slug -> sessionKey` 绑定、当前项目 session identity 在这条 stopgap 下都不变
+
 为配合这套 stopgap,Discovery 侧应优先:
 
 - `rg -n` 定位所需字段
@@ -111,17 +120,24 @@ workspace 层当前建议的阈值策略:
    - 默认绑定当前对话
    - `payload.kind` 应为 runtime 支持的 hidden/internal wake 类型
    - payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
+6. 若 wake 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
 
 ### wake 回合
 
 1. 读取目标 session 的 `sessions_history(..., includeTools=true)`
-2. 只提炼上次之后的新增动作
-3. 翻译成 1–3 条中文直播；必要时可合并一条关键委托/控制面同步事件
-4. 判断状态:
+2. 若本轮有 context usage ratio,先内部计算 compaction band,并决定是否规划 silent context nudge；若没有,跳过该步骤
+3. 只提炼上次之后的新增动作
+4. 翻译成 1–3 条中文直播；必要时可合并一条关键委托/控制面同步事件
+5. 判断状态:
    - 已交付 → 停播并汇总
    - 明确阻塞 → 停播并向用户转达
    - 长时间无新增 → 按阈值发一条低噪音进度心跳（默认至少间隔 60 秒）
    - 未结束 → 再安排下一次 wake
+
+注意:
+
+- silent context nudge 本身不是“可播报进度”; 即使本轮只发生了内部 nudge,也不应因此输出用户可见消息
+- 当前 workspace 仍未完成真正的 hidden `sessions_send` 投递,也还不能单靠 workspace 消掉 `[cron:...]` / `Current time` / `Reference UTC` 系统包裹
 
 ---
 
@@ -295,7 +311,10 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 2. **transcript 过滤**
    - internal wake 事件不能出现在用户可见对话中
 
-3. **增量 history**
+3. **hidden `sessions_send` 控制投递**
+   - silent context nudge 需要真正的内部控制通道,而不是用户可见消息
+
+4. **增量 history**
    - `sessions_history` 最好支持 `afterSeq` 或 cursor
    - 否则只能在本地靠 `lastSeenSeq + limit` 尽量规避重播,仍存在窗口过小导致漏播的风险
 
@@ -303,3 +322,4 @@ python3 runtime/watch-session-history.py agent:webgen:proj-<slug> --interval 5
 
 - 把泄露从“大段自然语言 cron 指令”收敛成“当前进度”
 - 把真实播报完全交给本地摘要层二次生成
+- 在有 context usage ratio 时,watcher 只做 silent context nudge 的内部决策与状态演进,不会单独对用户出声
