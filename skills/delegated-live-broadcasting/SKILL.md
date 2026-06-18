@@ -29,6 +29,8 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
    - **wake 载荷必须是隐藏的结构化状态**,而不是会出现在对话框里的自然语言调度提示词。
    - 允许的最小字段: `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`。
    - 如果 runtime 尚未支持 hidden/internal wake,不要回退到 `delivery.mode:"announce"` 直投当前对话; 可见文本只允许显示 `当前进度` 这 4 个字。
+   - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 来尝试回到当前用户对话继续直播。
+   - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再次 `cron.add` 新 job；优先续用当前 job，若支持则 `cron.update` 当前 job；若当前回合确实做不到，只能在下一次普通用户回合立刻补链，不能口头承诺后结束。
 
 3. **允许静默 context nudge,但它不是用户进度播报**
    - 如果 watcher 当前能拿到 context usage ratio,可在 wake 回合内部计算 `ok / warn / compact / force-compact` band,并在 band 升级时规划一条 silent context nudge,提醒 webgen 先检查 context、必要时 `/compact` 后继续当前任务。
@@ -51,7 +53,11 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
      1. 拉取目标 session history
      2. 补播最近关键步骤
      3. 明确说明漏播原因
-     4. 立刻恢复 wake 链
+   4. 立刻恢复 wake 链
+
+7. **错误路径硬禁令**
+   - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 来尝试回到当前用户对话继续直播。
+   - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，这不是“继续新建 cron”的信号，而是“只能操作当前 cron job”的限制提示。
 
 ## 推荐执行模板
 

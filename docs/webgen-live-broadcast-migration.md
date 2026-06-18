@@ -29,6 +29,17 @@
 
 > 当前 workspace 还额外接入了一条 **silent context nudge 决策路径**：当 watcher 能拿到 context usage ratio 时,可在 wake 周期里内部计算 `ok / warn / compact / force-compact` band,并规划 silent nudge;当拿不到 ratio 时,watcher 行为保持不变。这条路径目前只影响 watcher 内部状态与控制决策,**不会**单独产出用户可见进度消息。
 
+## 已确认的两条错误路径
+
+- 错误路径一：`sessionTarget:"main"` + `payload.kind:"systemEvent"` 把 wake 建进 dashboard/background session
+  - 结果不是“回到当前用户对话继续播报”，而是把后续轮询跑进独立的 cron/background session。
+  - 用户侧体感就是 webgen 明明在继续干活，但当前对话没有自动播报，只能手动追问。
+  - 现在规则层必须把这条路径视为硬错误，不允许拿它充当当前对话续播方案。
+- 错误路径二：wake 回合命中 `Cron tool is restricted to the current cron job.` 后又错误地再次 `cron.add`
+  - 这说明当前回合处于 cron 受限态，只能操作当前 job，不能继续新建新的 cron job。
+  - 正确策略是优先复用当前 job；若 runtime 支持则 `cron.update` 当前 job；若当前回合确实做不到，则在下一次普通用户回合第一时间补链。
+  - 不能口头说“之后再继续监听”然后结束，因为那不等于直播链已经恢复。
+
 ---
 
 ## 当前推荐架构
@@ -120,6 +131,7 @@ workspace 层当前建议的阈值策略:
    - 默认绑定当前对话
    - `payload.kind` 应为 runtime 支持的 hidden/internal wake 类型
    - payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
+   - 禁止把 wake 建成 `sessionTarget:"main"` + `payload.kind:"systemEvent"`，否则会落到 dashboard/background session
 6. 若 wake 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
 
 ### wake 回合
@@ -133,6 +145,10 @@ workspace 层当前建议的阈值策略:
    - 明确阻塞 → 停播并向用户转达
    - 长时间无新增 → 按阈值发一条低噪音进度心跳（默认至少间隔 60 秒）
    - 未结束 → 再安排下一次 wake
+6. 若本轮遇到 `Cron tool is restricted to the current cron job.`:
+   - 不要再次 `cron.add`
+   - 优先续用当前 job；若支持则 `cron.update` 当前 job
+   - 若当前回合确实无法续用，就把补链动作推迟到下一次普通用户回合，但不能把这轮失败包装成“监听已恢复”
 
 注意:
 

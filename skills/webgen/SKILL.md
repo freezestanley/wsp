@@ -34,6 +34,8 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
 5. **委托后立即监听**：
    - 首条播报"已委托 + 当前阶段 + 承载任务的 sessionKey"。
    - 同一回合内建立续航：用 `cron.add` 安排 20–40 秒后的 hidden/internal wake，payload 仅含结构化字段（watchId/targetSessionKey/lastSeenSeq/phase），**禁止**把自然语言调度提示词通过 announce 投进对话框。
+   - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 冒充“回到当前对话继续播报”。
+   - 若当前 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再次新建 `cron.add`；优先沿用当前 job，若 runtime 支持则 `cron.update` 当前 job；若当前回合做不到，就在下一次普通用户回合立即补链，不得把失败伪装成已续播。
    - 每次 wake 拉 `sessions_history(目标sessionKey, includeTools=true)`，只播**新增**步骤，翻译成 1–3 条中文人话。
    - 未交付/未阻塞则继续安排下一次 wake；交付或明确阻塞时停止并删除 cron。
 6. **澄清转达**：webgen 反问澄清 → 原样转给用户 → 用户答复 → 回传 webgen。
@@ -55,3 +57,4 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
 - 禁止 main 自行实现页面或做委托之外的事。
 - 禁止只委托不建监听续航。
 - 禁止把内部调度提示词（`[cron:...]`、`last_broadcast_seq=...` 等）泄露到用户对话。
+- 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 冒充“回到当前对话继续播报”。

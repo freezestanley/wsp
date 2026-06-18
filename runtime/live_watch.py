@@ -75,6 +75,52 @@ def save_watch_state(path: Path, state: WatchState) -> None:
     path.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
+    if not is_visible_wake_text(text):
+        return None
+
+    store = _read_state_store(path)
+    candidates: list[WatchState] = []
+    for watch_id, raw in store["watches"].items():
+        if not isinstance(watch_id, str) or not isinstance(raw, dict):
+            continue
+        candidates.append(
+            WatchState(
+                watch_id=watch_id,
+                target_session_key=str(raw.get("target_session_key") or ""),
+                last_seen_seq=int(raw.get("last_seen_seq", -1)),
+                last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
+                phase=str(raw.get("phase", "implementing")),
+                last_heartbeat_at=float(raw.get("last_heartbeat_at", 0.0)),
+                idle_poll_count=int(raw.get("idle_poll_count", 0)),
+                last_progress_summary=str(raw.get("last_progress_summary", "")),
+                last_control_event_id=str(raw.get("last_control_event_id", "")),
+                pending_control_summary=str(raw.get("pending_control_summary", "")),
+                last_context_band=str(raw.get("last_context_band", "ok")),
+                last_context_nudge_at=float(raw.get("last_context_nudge_at", 0.0)),
+                awaiting_context_ack=bool(raw.get("awaiting_context_ack", False)),
+            )
+        )
+
+    if not candidates:
+        return None
+
+    active_candidates = [
+        state for state in candidates
+        if state.phase not in {"done", "blocked", "canceled", "waiting_user"}
+    ]
+    pool = active_candidates or candidates
+    pool.sort(
+        key=lambda state: (
+            state.last_heartbeat_at,
+            state.last_broadcast_seq,
+            state.last_seen_seq,
+        ),
+        reverse=True,
+    )
+    return pool[0]
+
+
 def message_seq(msg: dict[str, Any], fallback: int) -> int:
     oc = msg.get("__openclaw") or {}
     seq = oc.get("seq")

@@ -11,6 +11,7 @@ from runtime.live_watch import (
     record_cycle_state,
     is_internal_prompt_text,
     load_watch_state,
+    resolve_visible_wake_state,
     save_watch_state,
     summarize_new_messages,
 )
@@ -133,7 +134,54 @@ class LiveWatchTests(unittest.TestCase):
 
         self.assertEqual(payload["watch_id"], "watch-webgen-demo")
         self.assertEqual(payload["target_session_key"], "agent:webgen:proj-demo")
-        self.assertEqual(payload["last_seen_seq"], 42)
+
+    def test_visible_wake_text_recovers_single_watch_from_state_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "watch-state.json"
+            state = WatchState(
+                watch_id="watch-webgen-demo",
+                target_session_key="agent:webgen:proj-demo",
+                last_seen_seq=42,
+                last_broadcast_seq=40,
+                phase="implementing",
+            )
+            save_watch_state(path, state)
+
+            resolved = resolve_visible_wake_state("当前进度", path)
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.watch_id, "watch-webgen-demo")
+        self.assertEqual(resolved.target_session_key, "agent:webgen:proj-demo")
+        self.assertEqual(resolved.last_seen_seq, 42)
+
+    def test_visible_wake_text_prefers_latest_active_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "watch-state.json"
+            done_state = WatchState(
+                watch_id="watch-webgen-old",
+                target_session_key="agent:webgen:proj-old",
+                last_seen_seq=80,
+                last_broadcast_seq=80,
+                phase="done",
+            )
+            active_state = WatchState(
+                watch_id="watch-webgen-new",
+                target_session_key="agent:webgen:proj-new",
+                last_seen_seq=12,
+                last_broadcast_seq=10,
+                phase="verifying",
+            )
+            save_watch_state(path, done_state)
+            save_watch_state(path, active_state)
+
+            resolved = resolve_visible_wake_state("当前进度", path)
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved.watch_id, "watch-webgen-new")
+        self.assertEqual(resolved.target_session_key, "agent:webgen:proj-new")
+        self.assertEqual(resolved.last_seen_seq, 12)
 
     def test_summarize_new_messages_only_emits_incremental_user_visible_items(self) -> None:
         messages = [
