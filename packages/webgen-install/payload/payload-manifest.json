@@ -1,6 +1,6 @@
 {
   "schema": "openclaw.webgen.payload-manifest.v1",
-  "generatedAt": "2026-06-18T00:09:57.166Z",
+  "generatedAt": "2026-06-18T03:59:41.858Z",
   "files": [
     "workspace/.agents/skills/design-taste-frontend/SKILL.md",
     "workspace/.gitignore",
@@ -11,6 +11,7 @@
     "workspace/SOUL.md",
     "workspace/TOOLS.md",
     "workspace/USER.md",
+    "workspace/config.js",
     "workspace/docs/plans/2026-06-15-huozheyan-official-site-design.md",
     "workspace/docs/plans/2026-06-15-huozheyan-official-site.md",
     "workspace/docs/plans/2026-06-15-webgen-superpowers-governance.md",
@@ -41,6 +42,8 @@
     "workspace/install/gsap-skills-main/.github/instructions/scrolltrigger.instructions.md",
     "workspace/install/gsap-skills-main/.gitignore",
     "workspace/install/gsap-skills-main/AGENTS.md",
+    "workspace/install/gsap-skills-main/CLAUDE.md",
+    "workspace/install/gsap-skills-main/GEMINI.md",
     "workspace/install/gsap-skills-main/LICENSE",
     "workspace/install/gsap-skills-main/README.md",
     "workspace/install/gsap-skills-main/assets/gsap-green.svg",
@@ -2183,6 +2186,7 @@
     "workspace/scripts/workflow-transition.sh",
     "workspace/scripts/workflow-write-code.sh",
     "workspace/skills-lock.json",
+    "workspace/skills/design-taste-frontend",
     "workspace/skills/frontend-design/.openclaw/source-origin.json",
     "workspace/skills/frontend-design/SKILL.md",
     "workspace/skills/frontend-design/reference/color-and-contrast.md",

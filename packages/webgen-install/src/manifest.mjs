@@ -11,6 +11,7 @@ const ALLOWED_EXACT = new Set([
   "workspace/SOUL.md",
   "workspace/TOOLS.md",
   "workspace/USER.md",
+  "workspace/config.js",
   "workspace/skills-lock.json",
   "workspace/.agents/skills/design-taste-frontend/SKILL.md",
 ]);
@@ -35,6 +36,11 @@ const BLOCKED_PREFIXES = [
   "workspace/projects/",
 ];
 
+const BLOCKED_SEGMENTS = [
+  "/__pycache__/",
+  "/node_modules/",
+];
+
 const MAIN_WORKSPACE_ALLOWED_EXACT = new Set([
   "AGENTS.md",
 ]);
@@ -45,19 +51,43 @@ const MAIN_WORKSPACE_ALLOWED_PREFIXES = [
   "skills/delegated-live-broadcasting/",
 ];
 
+function isBlockedRelativePath(normalized) {
+  if (!normalized || normalized.endsWith("/")) {
+    return false;
+  }
+  if (normalized.endsWith(".DS_Store") || normalized.endsWith(".pyc")) {
+    return true;
+  }
+  if (BLOCKED_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+    return true;
+  }
+  return BLOCKED_SEGMENTS.some(
+    (segment) => normalized.includes(segment) || normalized.endsWith(segment.slice(1, -1)),
+  );
+}
+
+function isWorkspaceRootDirectFile(normalized) {
+  if (!normalized.startsWith("workspace/")) {
+    return false;
+  }
+  const remainder = normalized.slice("workspace/".length);
+  return remainder.length > 0 && !remainder.includes("/");
+}
+
 export function shouldIncludeRelativePath(value) {
   const normalized = normalizeRelativePath(value);
   if (!normalized || normalized.endsWith("/")) {
     return false;
   }
-  if (normalized.endsWith(".DS_Store")) {
-    return false;
-  }
-  if (BLOCKED_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+  if (isBlockedRelativePath(normalized)) {
     return false;
   }
   if (ALLOWED_EXACT.has(normalized)) {
     return true;
+  }
+  if (isWorkspaceRootDirectFile(normalized)) {
+    const basename = normalized.slice("workspace/".length);
+    return !basename.startsWith(".");
   }
   return ALLOWED_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
@@ -67,10 +97,7 @@ export function shouldIncludeMainWorkspacePath(value) {
   if (!normalized || normalized.endsWith("/")) {
     return false;
   }
-  if (normalized.endsWith(".DS_Store")) {
-    return false;
-  }
-  if (normalized.includes("/__pycache__/") || normalized.endsWith(".pyc")) {
+  if (isBlockedRelativePath(normalized)) {
     return false;
   }
   if (MAIN_WORKSPACE_ALLOWED_EXACT.has(normalized)) {
@@ -84,7 +111,10 @@ export function shouldTraverseDirectory(value) {
   if (normalized === "./") {
     return true;
   }
-  if (BLOCKED_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+  if (
+    BLOCKED_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ||
+    BLOCKED_SEGMENTS.some((segment) => normalized.includes(segment))
+  ) {
     return false;
   }
   if (
@@ -112,7 +142,7 @@ async function walkFiles(rootDir, currentDir, results) {
       }
       continue;
     }
-    if (entry.isFile() && shouldIncludeRelativePath(relativePath)) {
+    if ((entry.isFile() || entry.isSymbolicLink()) && shouldIncludeRelativePath(relativePath)) {
       results.push(relativePath);
     }
   }
