@@ -29,6 +29,9 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
    - **wake 载荷必须是隐藏的结构化状态**,而不是会出现在对话框里的自然语言调度提示词。
    - 允许的最小字段: `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`。
    - 如果 runtime 尚未支持 hidden/internal wake,不要回退到 `delivery.mode:"announce"` 直投当前对话; 可见文本只允许显示 `当前进度` 这 4 个字。
+   - 如果 runtime 不支持 hidden/internal wake，但支持 `sessions_send(sessionKey=...)`，则必须记录 `originSessionKey` 并切到 **`rebroadcast`**：watcher 拿到新增摘要后主动回推到原会话。
+   - `sessions_send` 不能想当然默认可用；若 watcher 是经 HTTP gateway 调工具,应先根据 `gateway.tools.allow/deny` 判断它是否被显式放开。
+   - 只有在 hidden wake 和 `rebroadcast` 都不可用时，才允许退化到 **`manual_pull`**，并且不能对用户承诺“自动直播”。
    - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 来尝试回到当前用户对话继续直播。
    - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再次 `cron.add` 新 job；优先续用当前 job，若支持则 `cron.update` 当前 job；若当前回合确实做不到，只能在下一次普通用户回合立刻补链，不能口头承诺后结束。
 
@@ -64,17 +67,19 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 ### 委托当回合
 1. `sessions_send(sessionKey=..., message=完整任务包)`
 2. 向用户发送首条：已委托 + 当前阶段
-3. `cron.add` 创建一次 20–40 秒后的 wake，payload 为**隐藏的结构化 watch 状态**；如果做不到，就退化成短 token，而不是自然语言提示词
-4. 结束当前回合
+3. 记录 `originSessionKey`，并优先尝试 `hidden_wake`；若不支持则切到 `rebroadcast`
+4. `cron.add` 创建一次 20–40 秒后的 wake，payload 为**隐藏的结构化 watch 状态**；如果做不到，就退化成短 token，而不是自然语言提示词
+5. 结束当前回合
 
 ### wake 回合
 1. `sessions_history(sessionKey=目标session, includeTools=true, limit=适中)`
 2. 若当前有 context usage ratio，可先在内部计算 compaction band，并决定是否规划 silent context nudge；若没有 ratio，跳过这一步，其他行为不变
 3. 读取并提炼自上次播报后的新增动作
 4. 若有新增，则播报 1–3 条关键进展；若无新增，静默即可。仅 silent nudge 本身不能触发任何用户可见输出
-5. 判断是否已交付/阻塞
-6. 若未结束，则再次 `cron.add` 或 `cron.update` 安排下一次 wake
-7. 若连续多次 wake 都无新增，且距离上次心跳已超过阈值，可补一条低噪音“当前进度为…”心跳确认；默认最小间隔 60 秒
+5. 若当前策略是 `rebroadcast`，把这些关键进展合并后 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话
+6. 判断是否已交付/阻塞
+7. 若未结束，则再次 `cron.add` 或 `cron.update` 安排下一次 wake
+8. 若连续多次 wake 都无新增，且距离上次心跳已超过阈值，可补一条低噪音“当前进度为…”心跳确认；默认最小间隔 60 秒
 
 ## 播报约束
 
@@ -102,4 +107,5 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 - 用户从委托开始到交付/阻塞之间，始终能收到基于真实新增 history 的阶段性播报
 - 不再出现“webgen 已有大量输出，但 main 没有继续播”的情况
 - 不再出现 `[cron:...]` 或其他调度提示词泄露到用户对话的情况
+- 在无 runtime patch 的实例上，默认仍可通过 `originSessionKey + rebroadcast` 收到自动播报
 - deterministic resume 与既有 `sessionKey` 身份保持稳定,不会因为 context 风险而切新 session

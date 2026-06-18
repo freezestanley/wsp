@@ -1,16 +1,22 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { pathExists } from "./install-webgen.mjs";
+import { listAgents, pathExists, resolveMainWorkspaceDir } from "./install-webgen.mjs";
 
-export async function verifyInstall({ stateDir }) {
+export async function verifyInstall({ stateDir, openclawBin = "openclaw", mainWorkspaceDir }) {
+  const agents = await listAgents({ stateDir, openclawBin });
+  const resolvedMainWorkspaceDir = resolveMainWorkspaceDir({
+    stateDir,
+    explicitMainWorkspaceDir: mainWorkspaceDir,
+    agents,
+  });
   const requiredPaths = [
     join(stateDir, "agents", "webgen", "agent"),
     join(stateDir, "agents", "webgen", "workspace", "skills", "webgen", "SKILL.md"),
     join(stateDir, "agents", "webgen", "workspace", "scripts", "project-init.sh"),
-    join(stateDir, "workspace", "skills", "webgen", "SKILL.md"),
-    join(stateDir, "workspace", "skills", "delegated-live-broadcasting", "SKILL.md"),
-    join(stateDir, "workspace", "runtime", "live_watch.py"),
-    join(stateDir, "workspace", "AGENTS.md"),
+    join(resolvedMainWorkspaceDir, "skills", "webgen", "SKILL.md"),
+    join(resolvedMainWorkspaceDir, "skills", "delegated-live-broadcasting", "SKILL.md"),
+    join(resolvedMainWorkspaceDir, "runtime", "live_watch.py"),
+    join(resolvedMainWorkspaceDir, "AGENTS.md"),
   ];
 
   for (const pathname of requiredPaths) {
@@ -29,18 +35,19 @@ export async function verifyInstall({ stateDir }) {
     throw new Error('tools.sessions.visibility is not "all"');
   }
 
-  const agents = config.agents?.list ?? [];
-  if (!agents.some((agent) => agent.id === "webgen")) {
+  const configAgents = config.agents?.list ?? [];
+  if (!configAgents.some((agent) => agent.id === "webgen")) {
     throw new Error("webgen agent is missing from config");
   }
 
-  const agentsContent = await readFile(join(stateDir, "workspace", "AGENTS.md"), "utf8");
+  const agentsContent = await readFile(join(resolvedMainWorkspaceDir, "AGENTS.md"), "utf8");
   if (!agentsContent.includes("webgen-install:main-workspace-overlay:start")) {
     throw new Error("workspace/AGENTS.md is missing the managed webgen overlay block");
   }
 
   return {
     ok: true,
+    mainWorkspaceDir: resolvedMainWorkspaceDir,
     checkedPaths: requiredPaths,
   };
 }

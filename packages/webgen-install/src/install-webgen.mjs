@@ -5,12 +5,31 @@ import { tmpdir } from "node:os";
 import { applyMainWorkspaceOverlay } from "./main-workspace-overlay.mjs";
 import { runCommand } from "./utils.mjs";
 
+export function resolveMainWorkspaceDir({
+  stateDir,
+  explicitMainWorkspaceDir,
+  agents = [],
+}) {
+  if (explicitMainWorkspaceDir) {
+    return explicitMainWorkspaceDir;
+  }
+  const mainAgent = agents.find(
+    (agent) => agent && agent.id === "main" && typeof agent.workspace === "string" && agent.workspace,
+  );
+  if (mainAgent?.workspace) {
+    return mainAgent.workspace;
+  }
+  return join(stateDir, "workspace");
+}
+
 export function createInstallPlan({
   stateDir,
   model = "gpt5.5",
+  mainWorkspaceDir = join(stateDir, "workspace"),
 }) {
   return {
     extractDir: join(stateDir, "agents", "webgen"),
+    mainWorkspaceDir,
     agent: {
       id: "webgen",
       workspace: join(stateDir, "agents", "webgen", "workspace"),
@@ -37,7 +56,17 @@ export async function agentExists({ stateDir, openclawBin }) {
   return agents.some((agent) => agent.id === "webgen");
 }
 
-export async function extractPayload({ zipPath, extractDir, stateDir }) {
+export async function listAgents({ stateDir, openclawBin }) {
+  const output = runCommand(openclawBin, ["agents", "list", "--json"], {
+    env: {
+      ...process.env,
+      OPENCLAW_STATE_DIR: stateDir,
+    },
+  });
+  return JSON.parse(output || "[]");
+}
+
+export async function extractPayload({ zipPath, extractDir, stateDir, mainWorkspaceDir }) {
   const stageDir = await mkdtemp(join(tmpdir(), "webgen-install-stage-"));
   try {
     runCommand("unzip", ["-oq", zipPath, "-d", stageDir]);
@@ -47,7 +76,11 @@ export async function extractPayload({ zipPath, extractDir, stateDir }) {
       recursive: true,
       force: true,
     });
-    await applyMainWorkspaceOverlay({ stateDir, stageRoot: stageDir });
+    await applyMainWorkspaceOverlay({
+      stateDir,
+      stageRoot: stageDir,
+      targetWorkspace: mainWorkspaceDir,
+    });
   } finally {
     await rm(stageDir, { recursive: true, force: true });
   }

@@ -4,6 +4,8 @@ import {
   applyConfig,
   createInstallPlan,
   extractPayload,
+  listAgents,
+  resolveMainWorkspaceDir,
   registerAgent,
   syncIdentity,
 } from "./install-webgen.mjs";
@@ -14,11 +16,15 @@ export function listCommands() {
   return ["build", "install", "verify"];
 }
 
-function usage() {
+export function renderUsage() {
   return `Usage:
   openclaw-webgen-install build
-  openclaw-webgen-install install --state-dir <path> [--openclaw-bin openclaw]
-  openclaw-webgen-install verify --state-dir <path>`;
+  openclaw-webgen-install install --state-dir <path> [--openclaw-bin openclaw] [--main-workspace <path>]
+  openclaw-webgen-install verify --state-dir <path> [--openclaw-bin openclaw] [--main-workspace <path>]`;
+}
+
+function usage() {
+  return renderUsage();
 }
 
 export async function runCli(argv) {
@@ -45,22 +51,44 @@ export async function runCli(argv) {
     throw new Error("--state-dir is required");
   }
   const openclawBin = typeof args["openclaw-bin"] === "string" ? args["openclaw-bin"] : "openclaw";
+  const explicitMainWorkspaceDir =
+    typeof args["main-workspace"] === "string" ? args["main-workspace"] : undefined;
 
   if (command === "install") {
+    const agents = await listAgents({ stateDir, openclawBin });
+    const mainWorkspaceDir = resolveMainWorkspaceDir({
+      stateDir,
+      explicitMainWorkspaceDir,
+      agents,
+    });
     const plan = createInstallPlan({
       stateDir,
       model: typeof args.model === "string" ? args.model : undefined,
+      mainWorkspaceDir,
     });
     const zipPath = join(packageRoot, "payload", "webgen-agent-payload.zip");
-    await extractPayload({ zipPath, extractDir: plan.extractDir, stateDir });
+    await extractPayload({
+      zipPath,
+      extractDir: plan.extractDir,
+      stateDir,
+      mainWorkspaceDir: plan.mainWorkspaceDir,
+    });
     await registerAgent({ stateDir, openclawBin, plan });
     await syncIdentity({ stateDir, openclawBin, plan });
     await applyConfig({ stateDir, openclawBin, plan });
-    const result = await verifyInstall({ stateDir });
+    const result = await verifyInstall({
+      stateDir,
+      openclawBin,
+      mainWorkspaceDir: plan.mainWorkspaceDir,
+    });
     process.stdout.write(`${JSON.stringify({ installed: true, ...result }, null, 2)}\n`);
     return;
   }
 
-  const result = await verifyInstall({ stateDir });
+  const result = await verifyInstall({
+    stateDir,
+    openclawBin,
+    mainWorkspaceDir: explicitMainWorkspaceDir,
+  });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }

@@ -33,10 +33,12 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
    - 不要用 `agentId="webgen"` 落地实现，会撞 webgen 的单项目锁导致 ping-pong 死结。
 5. **委托后立即监听**：
    - 首条播报"已委托 + 当前阶段 + 承载任务的 sessionKey"。
-   - 同一回合内建立续航：用 `cron.add` 安排 20–40 秒后的 hidden/internal wake，payload 仅含结构化字段（watchId/targetSessionKey/lastSeenSeq/phase），**禁止**把自然语言调度提示词通过 announce 投进对话框。
+   - 同一回合内建立续航：优先使用 hidden/internal wake；若目标实例不支持 hidden wake,则必须记录 `originSessionKey` 并切到 `rebroadcast`，由 watcher 后续把新增摘要 `sessions_send` 回原会话。payload 仅含结构化字段（watchId/targetSessionKey/lastSeenSeq/phase），**禁止**把自然语言调度提示词通过 announce 投进对话框。
+   - `sessions_send` 经 HTTP gateway 默认可能被禁用；portable 模式下应先检查 `gateway.tools.allow/deny`，不要把 `rebroadcast` 当成无条件可用。
    - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 冒充“回到当前对话继续播报”。
    - 若当前 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再次新建 `cron.add`；优先沿用当前 job，若 runtime 支持则 `cron.update` 当前 job；若当前回合做不到，就在下一次普通用户回合立即补链，不得把失败伪装成已续播。
    - 每次 wake 拉 `sessions_history(目标sessionKey, includeTools=true)`，只播**新增**步骤，翻译成 1–3 条中文人话。
+   - 若当前策略是 `rebroadcast`,则这些中文摘要必须显式发回 `originSessionKey`,不要依赖“当前会话”隐式路由。
    - 未交付/未阻塞则继续安排下一次 wake；交付或明确阻塞时停止并删除 cron。
 6. **澄清转达**：webgen 反问澄清 → 原样转给用户 → 用户答复 → 回传 webgen。
 7. **交付汇总**：webgen 交付后，用 main 自己口吻汇总改了哪些文件、位置、如何预览、剩余风险。
@@ -58,3 +60,4 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
 - 禁止只委托不建监听续航。
 - 禁止把内部调度提示词（`[cron:...]`、`last_broadcast_seq=...` 等）泄露到用户对话。
 - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 冒充“回到当前对话继续播报”。
+- 禁止把 runtime patch 当成外部实例可用性的前提；迁移时默认先按 `rebroadcast` 能力设计。

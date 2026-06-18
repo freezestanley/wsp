@@ -27,6 +27,10 @@
 
 > 额外修正：旧方案把 `sessionTarget:"current" + agentTurn + delivery.mode:"announce"` 当作回到当前对话的办法，但这会把 `[cron:...]` 和整段内部调度文本泄露到用户对话。新的目标协议改成 **hidden/internal wake + 结构化状态 + wake 回合主动拉取 `sessions_history`**。在当前“外层 runtime 不可改”的约束下,workspace 内 fallback 的用户可见文本只显示 `当前进度`。
 
+> 迁移补充：`hidden/internal wake` 现在应被视为**增强能力**,不是可移植前提。对无法修改 runtime 的其他 OpenClaw 实例,workspace 侧默认走 **`originSessionKey + rebroadcast`**：记录原会话 `sessionKey`，由 watcher 在拿到新增摘要后主动 `sessions_send` 回该会话。只有在 hidden wake 和 rebroadcast 都不可用时，才退化到 `manual_pull`。
+
+> 实现补充：`rebroadcast` 不是无条件可用。当前 watcher 会先读取 gateway 配置判断 HTTP `/tools/invoke` 是否显式开放了 `sessions_send`；若 `gateway.tools.allow` 没有放开它，就会按默认安全策略判定为不可用并继续降级。`originSessionKey` 则支持通过显式参数或环境变量 `OPENCLAW_ORIGIN_SESSION_KEY` 注入。
+
 > 当前 workspace 还额外接入了一条 **silent context nudge 决策路径**：当 watcher 能拿到 context usage ratio 时,可在 wake 周期里内部计算 `ok / warn / compact / force-compact` band,并规划 silent nudge;当拿不到 ratio 时,watcher 行为保持不变。这条路径目前只影响 watcher 内部状态与控制决策,**不会**单独产出用户可见进度消息。
 
 ## 已确认的两条错误路径
@@ -58,6 +62,7 @@
 
 - `sessions_send(...)`
   - 负责把原始用户需求发给 `webgen`
+  - 在 `rebroadcast` 模式下负责把新增摘要主动回推到 `originSessionKey`
 - `sessions_history(...)`
   - 负责读取被委托 session 的真实新增动作
 - `cron.add(...)`
@@ -74,6 +79,10 @@
 - `runtime/live-webgen-progress.py`
   - 面向人类调试的直播摘要器
   - 可自动把 `toolResult` / `assistant` 进展转成中文摘要
+  - 支持 `hidden_wake / rebroadcast / manual_pull` 三档投递策略
+  - 会自动读取 gateway 配置推断 `sessions_send` 能否经 HTTP 使用
+  - 支持从 `OPENCLAW_ORIGIN_SESSION_KEY` 读取来源会话
+  - 若外部未显式提供 `watch_id / state_file`，会按目标 session 自动生成稳定的 watch 配置
   - 若提供 context usage ratio,可额外做 silent context nudge 决策;若不提供,行为与原先一致
 - `runtime/watch-session-history.py`
   - 面向底层排查的原始 history 观察器
@@ -127,12 +136,16 @@ workspace 层当前建议的阈值策略:
 4. 立即向用户发首条直播:
    - 已委托给哪个 session
    - 当前阶段(Discovery / 实现 / 验证)
-5. 立刻创建一次 `cron wake`
-   - 默认绑定当前对话
-   - `payload.kind` 应为 runtime 支持的 hidden/internal wake 类型
-   - payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
+5. 记录 `originSessionKey`
+6. 选择能力档位
+   - 优先 `hidden_wake`
+   - 无 hidden wake 但有 `sessions_send(sessionKey=...)` → `rebroadcast`
+   - 两者都没有 → `manual_pull`
+7. 立刻创建一次 `cron wake`
+   - `hidden_wake`：payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
+   - `rebroadcast`：wake / watcher 可以跑在独立承载 session，但后续摘要必须显式回推到 `originSessionKey`
    - 禁止把 wake 建成 `sessionTarget:"main"` + `payload.kind:"systemEvent"`，否则会落到 dashboard/background session
-6. 若 wake 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
+8. 若 wake 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
 
 ### wake 回合
 
@@ -140,12 +153,13 @@ workspace 层当前建议的阈值策略:
 2. 若本轮有 context usage ratio,先内部计算 compaction band,并决定是否规划 silent context nudge；若没有,跳过该步骤
 3. 只提炼上次之后的新增动作
 4. 翻译成 1–3 条中文直播；必要时可合并一条关键委托/控制面同步事件
-5. 判断状态:
+5. 若当前档位是 `rebroadcast`,把这些摘要显式 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回原会话
+6. 判断状态:
    - 已交付 → 停播并汇总
    - 明确阻塞 → 停播并向用户转达
    - 长时间无新增 → 按阈值发一条低噪音进度心跳（默认至少间隔 60 秒）
    - 未结束 → 再安排下一次 wake
-6. 若本轮遇到 `Cron tool is restricted to the current cron job.`:
+7. 若本轮遇到 `Cron tool is restricted to the current cron job.`:
    - 不要再次 `cron.add`
    - 优先续用当前 job；若支持则 `cron.update` 当前 job
    - 若当前回合确实无法续用，就把补链动作推迟到下一次普通用户回合，但不能把这轮失败包装成“监听已恢复”
@@ -154,6 +168,7 @@ workspace 层当前建议的阈值策略:
 
 - silent context nudge 本身不是“可播报进度”; 即使本轮只发生了内部 nudge,也不应因此输出用户可见消息
 - 当前 workspace 仍未完成真正的 hidden `sessions_send` 投递,也还不能单靠 workspace 消掉 `[cron:...]` / `Current time` / `Reference UTC` 系统包裹
+- `rebroadcast` 的目标不是“让 cron 理解当前会话”,而是“让用户当前对话收到摘要”;因此它是可迁移基础能力,`hidden_wake` 才是增强体验
 
 ---
 
@@ -192,6 +207,35 @@ wake 回合拿到该 payload 后,再由 main 主动:
 2. 本地摘要层必须把这类文本识别为内部 wake 文本并过滤
 3. 旧格式 `当前进度为：__oc_live__...` 仍保留兼容识别,但不再新生成
 4. `REPLY_SKIP`、`inter-session routing echo`、`Nothing to broadcast`、`Staying silent` 这类内部跳过/回声文本也必须静默过滤
+
+---
+
+## watcher bootstrap 约定
+
+为减少 main/调用方手工拼接参数,当前 watcher 已支持以下默认约定:
+
+- 未显式传 `watch_id` 时,按目标 session 生成稳定 ID
+  - 例：`agent:webgen:proj-demo` → `watch-agent-webgen-proj-demo`
+- 未显式传 `state_file` 时,默认写入:
+  - `/tmp/openclaw-live-watch/<watch_id>.json`
+- 未显式传 `originSessionKey` 参数时,可从环境变量读取:
+  - `OPENCLAW_ORIGIN_SESSION_KEY`
+
+这意味着调用方最少只要提供:
+
+- 目标 `sessionKey`
+- 原会话 `originSessionKey`（参数或环境变量二选一）
+
+剩余 watch 配置可由脚本自行补齐。
+
+如果调用方是在 Python 侧直接组装 watcher 启动命令，推荐顺序是：
+
+1. `build_watch_bootstrap(...)`
+   - 生成稳定的 `watch_id / state_file / delivery_strategy`
+2. `build_watch_invocation(...)`
+   - 生成 `command + env`
+   - 默认把 `originSessionKey` 放进 `OPENCLAW_ORIGIN_SESSION_KEY`
+   - 避免调用方自己重复拼 `--state-file`、`--watch-id`、`--delivery-strategy`
 
 ---
 

@@ -17,6 +17,151 @@ def load_live_webgen_progress_module():
 
 
 class LiveWebgenProgressTests(unittest.TestCase):
+    def test_resolve_gateway_sessions_send_support_respects_default_http_deny(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "resolve_gateway_sessions_send_support"),
+            "resolve_gateway_sessions_send_support must be implemented",
+        )
+
+        self.assertFalse(module.resolve_gateway_sessions_send_support({}))
+        self.assertFalse(
+            module.resolve_gateway_sessions_send_support(
+                {"gateway": {"tools": {"allow": [], "deny": []}}}
+            )
+        )
+        self.assertTrue(
+            module.resolve_gateway_sessions_send_support(
+                {"gateway": {"tools": {"allow": ["sessions_send"]}}}
+            )
+        )
+        self.assertFalse(
+            module.resolve_gateway_sessions_send_support(
+                {"gateway": {"tools": {"allow": ["sessions_send"], "deny": ["sessions_send"]}}}
+            )
+        )
+
+    def test_resolve_origin_session_key_prefers_cli_then_env(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "resolve_origin_session_key"),
+            "resolve_origin_session_key must be implemented",
+        )
+
+        self.assertEqual(
+            module.resolve_origin_session_key("agent:main:cli", {"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:env"}),
+            "agent:main:cli",
+        )
+        self.assertEqual(
+            module.resolve_origin_session_key("", {"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:env"}),
+            "agent:main:env",
+        )
+        self.assertEqual(module.resolve_origin_session_key("", {}), "")
+
+    def test_resolve_watch_runtime_config_derives_state_file_when_missing(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "resolve_watch_runtime_config"),
+            "resolve_watch_runtime_config must be implemented",
+        )
+
+        cfg = {"gateway": {"tools": {"allow": ["sessions_send"]}}}
+        resolved = module.resolve_watch_runtime_config(
+            cfg=cfg,
+            session_key="agent:webgen:proj-demo",
+            state_file="",
+            watch_id="default",
+            origin_session_key="",
+            requested_origin_session_key="",
+            env={"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:discord:dm:buddy"},
+            delivery_strategy="auto",
+            supports_hidden_wake=False,
+            supports_sessions_send=False,
+        )
+
+        self.assertEqual(resolved["watch_id"], "watch-agent-webgen-proj-demo")
+        self.assertEqual(resolved["origin_session_key"], "agent:main:discord:dm:buddy")
+        self.assertEqual(resolved["delivery_strategy"], "rebroadcast")
+        self.assertTrue(str(resolved["state_file"]).endswith("/watch-agent-webgen-proj-demo.json"))
+
+    def test_render_batch_text_joins_summaries_for_rebroadcast(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "render_batch_text"),
+            "render_batch_text must be implemented",
+        )
+
+        text = module.render_batch_text(
+            [
+                {"summary": "✅ 构建成功：vite build"},
+                {"summary": "💬 已完成首版实现，正在截图验证"},
+            ]
+        )
+
+        self.assertEqual(text, "✅ 构建成功：vite build\n💬 已完成首版实现，正在截图验证")
+
+    def test_deliver_batch_rebroadcasts_to_origin_session(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "deliver_batch"),
+            "deliver_batch must be implemented",
+        )
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_send(_url: str, _headers: dict[str, str], session_key: str, message: str) -> None:
+            calls.append((session_key, message))
+
+        output = io.StringIO()
+        delivered = module.deliver_batch(
+            [
+                {"summary": "✅ 构建成功：vite build"},
+                {"summary": "💬 已完成首版实现，正在截图验证"},
+            ],
+            delivery_strategy="rebroadcast",
+            origin_session_key="chat:current",
+            url="http://127.0.0.1:1/tools/invoke",
+            headers={},
+            send_fn=fake_send,
+            jsonl=False,
+            stream=output,
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(
+            calls,
+            [("chat:current", "✅ 构建成功：vite build\n💬 已完成首版实现，正在截图验证")],
+        )
+        self.assertEqual(output.getvalue(), "")
+
+    def test_deliver_batch_manual_pull_writes_locally(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "deliver_batch"),
+            "deliver_batch must be implemented",
+        )
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_send(_url: str, _headers: dict[str, str], session_key: str, message: str) -> None:
+            calls.append((session_key, message))
+
+        output = io.StringIO()
+        delivered = module.deliver_batch(
+            [{"seq": 12, "kind": "assistant", "summary": "💬 已完成首版实现，正在截图验证"}],
+            delivery_strategy="manual_pull",
+            origin_session_key="chat:current",
+            url="http://127.0.0.1:1/tools/invoke",
+            headers={},
+            send_fn=fake_send,
+            jsonl=False,
+            stream=output,
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(calls, [])
+        self.assertIn("正在截图验证", output.getvalue())
+
     def test_context_usage_ratio_none_is_true_noop_even_with_ack_like_items(self) -> None:
         module = load_live_webgen_progress_module()
         self.assertTrue(

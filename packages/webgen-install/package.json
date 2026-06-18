@@ -1,13 +1,21 @@
 {
   "name": "openclaw-webgen-install",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
+  "files": [
+    "README.md",
+    "bin",
+    "payload",
+    "scripts",
+    "src"
+  ],
   "bin": {
     "openclaw-webgen-install": "./bin/openclaw-webgen-install.mjs"
   },
   "scripts": {
     "build:payload": "node ./bin/openclaw-webgen-install.mjs build",
+    "build:tgz": "npm pack --pack-destination ./dist",
     "release:local": "bash ./scripts/build-release.sh",
     "test": "node --test ./tests/*.test.mjs"
   }

@@ -13,9 +13,15 @@ export function createReleaseConfig({
     "dist",
     `${packageJson.name}-${packageJson.version}.zip`,
   );
+  const distPackagePath = join(
+    packageRoot,
+    "dist",
+    `${packageJson.name}-${packageJson.version}.tgz`,
+  );
 
   return {
     desktopTargetDir,
     distArchivePath,
+    distPackagePath,
   };
 }

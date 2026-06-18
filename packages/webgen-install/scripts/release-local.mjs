@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildPayload } from "../src/build-payload.mjs";
 import { createReleaseConfig } from "../src/release-config.mjs";
@@ -56,6 +56,14 @@ async function createArchive({ stagePackageDir, archivePath }) {
   runCommand("zip", ["-qr", archivePath, "."], { cwd: stagePackageDir });
 }
 
+async function createNpmPackage({ stagePackageDir, packagePath }) {
+  await mkdir(dirname(packagePath), { recursive: true });
+  await rm(packagePath, { force: true });
+  runCommand("npm", ["pack", "--pack-destination", dirname(packagePath)], {
+    cwd: stagePackageDir,
+  });
+}
+
 async function main() {
   const packageRoot = packageRootFromMeta(import.meta.url);
   const packageJson = JSON.parse(
@@ -87,6 +95,10 @@ async function main() {
       stagePackageDir,
       archivePath: releaseConfig.distArchivePath,
     });
+    await createNpmPackage({
+      stagePackageDir,
+      packagePath: releaseConfig.distPackagePath,
+    });
   } finally {
     await rm(stageRoot, { recursive: true, force: true });
   }
@@ -97,6 +109,7 @@ async function main() {
         ok: true,
         targetDir: releaseConfig.desktopTargetDir,
         archivePath: releaseConfig.distArchivePath,
+        packagePath: releaseConfig.distPackagePath,
       },
       null,
       2,

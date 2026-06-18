@@ -259,6 +259,14 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 `sessions_send(agentId="webgen", ...)` **永远只路由到 `agent:webgen:main`**,而该 session 会被 webgen 自己的 SO-002(单项目锁定)锁在某个旧项目上,新项目在那写不了 → 它把任务包弹回 main → main 再走 agentId → **无限 ping-pong 死结**(已踩坑实测)。
 
+### 直播能力分层(迁移到其他 OpenClaw 时强制遵守)
+
+- `hidden_wake`：增强档。只有目标实例 runtime 明确支持 hidden/internal wake 且能绑定当前对话时才使用。
+- `rebroadcast`：可迁移默认档。若 runtime 不支持 hidden wake，但可以显式拿到 `originSessionKey` 且支持 `sessions_send(sessionKey=...)`，则 watcher 必须把新增摘要主动回推到该 `originSessionKey`。
+- 若 watcher 走 HTTP gateway,`sessions_send` 默认可能被安全策略禁用；应先检查 `gateway.tools.allow/deny`,确认它真的可用后再选 `rebroadcast`。
+- `manual_pull`：末级降档。若既没有 hidden wake，也无法稳定回推原会话，则不要承诺“自动直播”，只保留手动进度查询。
+- **禁止**把 runtime patch 当成监听能否工作的前提；对外迁移时，默认先假设只能走 `rebroadcast` 或 `manual_pull`。
+
 ### 老项目修改:先做确定性 resume 预检
 
 - 当用户明确是在**修改老项目**，并且消息里**确定性**出现以下任一标识时，main 在创建新 session 前**必须优先复用旧项目 session**，不要先开新 session 再让 webgen 自己回找：
@@ -290,9 +298,10 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 2. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`**。若第 1 步命中老项目 resume,则这里的 `sessionKey` 必须使用 resolver 返回值。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
 3. **委托后立即进入监听模式**:
    - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
-   - 然后**同一回合内**安排续航:默认调用 `cron.add` 创建一次 20–40 秒后的 wake,并使用 **hidden/internal payload** 绑定到当前对话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若 runtime 暂不支持 hidden wake,则可见文本只允许显示 `当前进度`。
+   - 然后**同一回合内**安排续航:优先走 `hidden_wake`; 若当前实例不支持 hidden wake,则必须记录 `originSessionKey` 并切到 `rebroadcast`，由 watcher 后续把新增摘要主动 `sessions_send` 回原会话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若只能退化到可见 fallback 文本,则只允许显示 `当前进度`。
    - 若本轮安排 wake 时发现方案实际落点是 `sessionTarget:"main"` + `payload.kind:"systemEvent"`，视为路由错误；这会把 job 建进 dashboard/background session，而不是当前用户对话，必须立即改回当前对话绑定的 hidden/internal wake。
    - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
+   - 若当前监听策略是 `rebroadcast`,则 wake / watcher 回合在拿到新增摘要后,必须显式 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话,而不是依赖“当前会话”隐式路由。
    - 若 wake 回合还能拿到 context usage ratio,可额外走一条**静默** context nudge 决策路径:内部算 band,必要时规划 silent nudge;但这条路径只更新 watcher 内部状态/控制动作,**不能**因此单独产出用户可见进度。若拿不到 ratio,按原监听逻辑继续即可。
    - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
@@ -309,7 +318,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 作为“继续在当前对话里直播”的续航方式。
 - 旧做法里,`sessionTarget:"current" + payload.kind:"agentTurn" + delivery.mode:"announce"` 会把原始 cron 提示词编进当前对话上下文,导致用户直接看到 `[cron:...]` 与整段调度指令。
 - 所以,凡是目标是“继续在当前用户对话里监听”,默认都应改用 **hidden/internal wake**:唤醒事件只注入结构化状态,对话框里只显示 wake 回合重新生成的人话摘要。
-- 如果 runtime 尚未支持 hidden wake,则视为**协议未就绪**;不要回退到会泄露内部提示词的可见 announce。
+- 如果 runtime 尚未支持 hidden wake,默认切到 **`rebroadcast + originSessionKey`**；只有在连原会话回推也不可用时,才视为只能 `manual_pull`,不要回退到会泄露内部提示词的可见 announce。
 - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，说明当前回合只能操作当前 cron job；不要再新建额外 job，更不要把失败误判成“已经续航成功”。
 - 同理,真正的 hidden `sessions_send` 控制投递以及 `[cron:...]` / `Current time` / `Reference UTC` 的系统包裹抑制,仍依赖上游 runtime;workspace 当前只允许先把 silent context nudge 规划成内部动作,不宣称这些 runtime 能力已经完工。
 

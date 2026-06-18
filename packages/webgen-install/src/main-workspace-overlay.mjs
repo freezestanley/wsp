@@ -110,15 +110,15 @@ export async function stageMainWorkspaceOverlay({ packageRoot, stageRoot }) {
   };
 }
 
-export async function applyMainWorkspaceOverlay({ stateDir, stageRoot }) {
+export async function applyMainWorkspaceOverlay({ stateDir, stageRoot, targetWorkspace }) {
   const overlayRoot = join(stageRoot, "main-workspace-overlay");
-  const targetWorkspace = join(stateDir, "workspace");
-  const targetSkills = join(targetWorkspace, "skills");
+  const resolvedTargetWorkspace = targetWorkspace || join(stateDir, "workspace");
+  const targetSkills = join(resolvedTargetWorkspace, "skills");
   await mkdir(targetSkills, { recursive: true });
 
   const overlayEntries = await collectMainWorkspaceOverlayEntries(overlayRoot);
   for (const entry of overlayEntries) {
-    const destination = join(targetWorkspace, entry);
+    const destination = join(resolvedTargetWorkspace, entry);
     await mkdir(join(destination, ".."), { recursive: true });
     await cp(join(overlayRoot, entry), destination, {
       recursive: false,
@@ -127,7 +127,7 @@ export async function applyMainWorkspaceOverlay({ stateDir, stageRoot }) {
   }
 
   const sectionContent = await readFile(join(overlayRoot, "AGENTS.webgen-section.md"), "utf8");
-  const targetAgentsPath = join(targetWorkspace, "AGENTS.md");
+  const targetAgentsPath = join(resolvedTargetWorkspace, "AGENTS.md");
   let currentAgents = "";
   try {
     currentAgents = await readFile(targetAgentsPath, "utf8");

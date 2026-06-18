@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from runtime.live_wake_token import is_visible_wake_text, looks_like_wake_token
 class WatchState:
     watch_id: str
     target_session_key: str
+    origin_session_key: str = ""
+    delivery_strategy: str = "hidden_wake"
     last_seen_seq: int = -1
     last_broadcast_seq: int = -1
     phase: str = "implementing"
@@ -54,6 +57,8 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
     return WatchState(
         watch_id=watch_id,
         target_session_key=str(raw.get("target_session_key") or target_session_key or ""),
+        origin_session_key=str(raw.get("origin_session_key") or ""),
+        delivery_strategy=str(raw.get("delivery_strategy") or "hidden_wake"),
         last_seen_seq=int(raw.get("last_seen_seq", -1)),
         last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
         phase=str(raw.get("phase", "implementing")),
@@ -88,6 +93,8 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
             WatchState(
                 watch_id=watch_id,
                 target_session_key=str(raw.get("target_session_key") or ""),
+                origin_session_key=str(raw.get("origin_session_key") or ""),
+                delivery_strategy=str(raw.get("delivery_strategy") or "hidden_wake"),
                 last_seen_seq=int(raw.get("last_seen_seq", -1)),
                 last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
                 phase=str(raw.get("phase", "implementing")),
@@ -119,6 +126,137 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
         reverse=True,
     )
     return pool[0]
+
+
+def resolve_delivery_strategy(
+    *,
+    requested_strategy: str,
+    supports_hidden_wake: bool,
+    supports_sessions_send: bool,
+    origin_session_key: str,
+) -> str:
+    requested = (requested_strategy or "auto").strip().lower()
+    if requested and requested != "auto":
+        return requested
+    if supports_hidden_wake:
+        return "hidden_wake"
+    if supports_sessions_send and origin_session_key.strip():
+        return "rebroadcast"
+    return "manual_pull"
+
+
+def prepare_watch_state(
+    state: WatchState,
+    *,
+    target_session_key: str,
+    origin_session_key: str,
+    requested_strategy: str,
+    supports_hidden_wake: bool,
+    supports_sessions_send: bool,
+) -> WatchState:
+    resolved_origin = origin_session_key.strip() or state.origin_session_key
+    resolved_target = target_session_key.strip() or state.target_session_key
+    resolved_strategy = resolve_delivery_strategy(
+        requested_strategy=requested_strategy,
+        supports_hidden_wake=supports_hidden_wake,
+        supports_sessions_send=supports_sessions_send,
+        origin_session_key=resolved_origin,
+    )
+    return _replace_state(
+        state,
+        target_session_key=resolved_target,
+        origin_session_key=resolved_origin,
+        delivery_strategy=resolved_strategy,
+    )
+
+
+def normalize_watch_id_component(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    return normalized or "default"
+
+
+def build_watch_bootstrap(
+    *,
+    target_session_key: str,
+    origin_session_key: str,
+    requested_strategy: str,
+    supports_hidden_wake: bool,
+    supports_sessions_send: bool,
+    watch_id: str | None = None,
+    state_root: Path | None = None,
+) -> dict[str, Any]:
+    resolved_watch_id = watch_id.strip() if isinstance(watch_id, str) and watch_id.strip() else (
+        f"watch-{normalize_watch_id_component(target_session_key)}"
+    )
+    resolved_state_root = state_root or (Path(tempfile.gettempdir()) / "openclaw-live-watch")
+    state = prepare_watch_state(
+        WatchState(
+            watch_id=resolved_watch_id,
+            target_session_key=target_session_key,
+        ),
+        target_session_key=target_session_key,
+        origin_session_key=origin_session_key,
+        requested_strategy=requested_strategy,
+        supports_hidden_wake=supports_hidden_wake,
+        supports_sessions_send=supports_sessions_send,
+    )
+    return {
+        "watch_id": state.watch_id,
+        "state_file": resolved_state_root / f"{state.watch_id}.json",
+        "target_session_key": state.target_session_key,
+        "origin_session_key": state.origin_session_key,
+        "delivery_strategy": state.delivery_strategy,
+    }
+
+
+def build_watch_invocation(
+    bootstrap: dict[str, Any],
+    *,
+    python_bin: str = "python3",
+    script_path: str = "runtime/live-webgen-progress.py",
+    interval: float = 5.0,
+    limit: int = 30,
+    max_items: int = 3,
+    auto_switch_webgen: bool = False,
+    once: bool = False,
+    jsonl: bool = False,
+    supports_hidden_wake: bool = False,
+) -> dict[str, Any]:
+    command = [
+        python_bin,
+        script_path,
+        str(bootstrap["target_session_key"]),
+        "--interval",
+        str(interval),
+        "--limit",
+        str(limit),
+        "--max-items",
+        str(max_items),
+        "--state-file",
+        str(bootstrap["state_file"]),
+        "--watch-id",
+        str(bootstrap["watch_id"]),
+        "--delivery-strategy",
+        str(bootstrap["delivery_strategy"]),
+    ]
+    if auto_switch_webgen:
+        command.append("--auto-switch-webgen")
+    if once:
+        command.append("--once")
+    if jsonl:
+        command.append("--jsonl")
+    if supports_hidden_wake:
+        command.append("--supports-hidden-wake")
+
+    env: dict[str, str] = {}
+    origin_session_key = str(bootstrap.get("origin_session_key", "")).strip()
+    if origin_session_key:
+        env["OPENCLAW_ORIGIN_SESSION_KEY"] = origin_session_key
+
+    return {
+        "command": command,
+        "env": env,
+    }
 
 
 def message_seq(msg: dict[str, Any], fallback: int) -> int:

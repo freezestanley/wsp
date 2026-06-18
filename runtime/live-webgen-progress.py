@@ -15,6 +15,8 @@ if __package__ in (None, ''):
 
 from runtime.live_watch import (
     build_broadcast_batch,
+    build_watch_bootstrap,
+    prepare_watch_state,
     WatchState,
     load_watch_state,
     record_control_event,
@@ -27,6 +29,13 @@ from runtime.context_stopgap import compaction_band_for_ratio
 from runtime.context_stopgap import truncate_tool_output
 
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
+DEFAULT_HTTP_GATEWAY_DENY = {
+    'sessions_spawn',
+    'sessions_send',
+    'cron',
+    'gateway',
+    'whatsapp_login',
+}
 
 
 def load_config() -> dict[str, Any]:
@@ -46,6 +55,64 @@ def gateway_endpoint(cfg: dict[str, Any]) -> tuple[str, dict[str, str]]:
             raise RuntimeError(f'gateway.auth.mode={mode} 但配置里没有 token/password')
         headers['Authorization'] = f'Bearer {secret}'
     return f'http://127.0.0.1:{port}/tools/invoke', headers
+
+
+def resolve_gateway_sessions_send_support(cfg: dict[str, Any]) -> bool:
+    gateway_tools = cfg.get('gateway', {}).get('tools', {})
+    allow = {
+        str(name).strip()
+        for name in gateway_tools.get('allow', [])
+        if isinstance(name, str) and str(name).strip()
+    }
+    deny = {
+        str(name).strip()
+        for name in gateway_tools.get('deny', [])
+        if isinstance(name, str) and str(name).strip()
+    }
+    if 'sessions_send' in deny:
+        return False
+    if 'sessions_send' in DEFAULT_HTTP_GATEWAY_DENY and 'sessions_send' not in allow:
+        return False
+    return True
+
+
+def resolve_origin_session_key(cli_value: str, env: dict[str, str]) -> str:
+    if cli_value.strip():
+        return cli_value.strip()
+    raw = env.get('OPENCLAW_ORIGIN_SESSION_KEY', '')
+    return raw.strip()
+
+
+def resolve_watch_runtime_config(
+    *,
+    cfg: dict[str, Any],
+    session_key: str,
+    state_file: str,
+    watch_id: str,
+    origin_session_key: str,
+    requested_origin_session_key: str,
+    env: dict[str, str],
+    delivery_strategy: str,
+    supports_hidden_wake: bool,
+    supports_sessions_send: bool,
+) -> dict[str, Any]:
+    effective_origin_session_key = (
+        origin_session_key.strip() or resolve_origin_session_key(requested_origin_session_key, env)
+    )
+    effective_supports_sessions_send = supports_sessions_send or resolve_gateway_sessions_send_support(cfg)
+    effective_watch_id = "" if watch_id == "default" else watch_id
+    bootstrap = build_watch_bootstrap(
+        target_session_key=session_key,
+        origin_session_key=effective_origin_session_key,
+        requested_strategy=delivery_strategy,
+        supports_hidden_wake=supports_hidden_wake,
+        supports_sessions_send=effective_supports_sessions_send,
+        watch_id=effective_watch_id,
+    )
+    resolved_state_file = Path(state_file) if state_file else bootstrap["state_file"]
+    bootstrap["state_file"] = resolved_state_file
+    bootstrap["supports_sessions_send"] = effective_supports_sessions_send
+    return bootstrap
 
 
 def invoke_tool(url: str, headers: dict[str, str], tool: str, args: dict[str, Any]) -> Any:
@@ -85,6 +152,13 @@ def invoke_sessions_list(url: str, headers: dict[str, str], agent_id: str, limit
         'limit': limit,
     })
     return result or {'sessions': []}
+
+
+def invoke_sessions_send(url: str, headers: dict[str, str], session_key: str, message: str) -> None:
+    invoke_tool(url, headers, 'sessions_send', {
+        'sessionKey': session_key,
+        'message': message,
+    })
 
 
 def pick_webgen_project_session(sessions_payload: dict[str, Any]) -> str | None:
@@ -139,6 +213,34 @@ def emit_batch(batch: list[dict[str, Any]], *, jsonl: bool, stream: TextIO) -> N
     stream.flush()
 
 
+def render_batch_text(batch: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        str(item.get("summary", "")).strip()
+        for item in batch
+        if str(item.get("summary", "")).strip()
+    )
+
+
+def deliver_batch(
+    batch: list[dict[str, Any]],
+    *,
+    delivery_strategy: str,
+    origin_session_key: str,
+    url: str,
+    headers: dict[str, str],
+    send_fn,
+    jsonl: bool,
+    stream: TextIO,
+) -> bool:
+    if delivery_strategy == "rebroadcast" and origin_session_key.strip():
+        text = render_batch_text(batch)
+        if text:
+            send_fn(url, headers, origin_session_key, text)
+            return True
+    emit_batch(batch, jsonl=jsonl, stream=stream)
+    return False
+
+
 def evaluate_silent_context_nudge_cycle(
     state: WatchState,
     *,
@@ -180,17 +282,41 @@ def main() -> int:
     parser.add_argument('--control-phase', help='可选：注入控制面事件后的阶段标记')
     parser.add_argument('--context-usage-ratio', type=float, default=None, help='可选：注入本轮 context 使用率，0..1 或百分比')
     parser.add_argument('--context-nudge-cooldown-seconds', type=float, default=300.0, help='silent context nudge 的最小重试间隔秒数，默认 300')
+    parser.add_argument('--origin-session-key', default='', help='可选：直播摘要应回推到的来源会话 sessionKey')
+    parser.add_argument('--delivery-strategy', default='auto', choices=['auto', 'hidden_wake', 'rebroadcast', 'manual_pull'], help='直播投递策略，默认 auto')
+    parser.add_argument('--supports-hidden-wake', action='store_true', help='声明当前实例支持 hidden/internal wake')
+    parser.add_argument('--supports-sessions-send', action='store_true', help='声明当前实例支持 sessions_send 回推')
     args = parser.parse_args()
     context_usage_ratio = normalize_context_usage_ratio(args.context_usage_ratio)
     context_nudge_cooldown_seconds = sanitize_context_nudge_cooldown_seconds(args.context_nudge_cooldown_seconds)
 
     cfg = load_config()
     url, headers = gateway_endpoint(cfg)
-    state_path = Path(args.state_file) if args.state_file else None
+    runtime_config = resolve_watch_runtime_config(
+        cfg=cfg,
+        session_key=args.session_key,
+        state_file=args.state_file or "",
+        watch_id=args.watch_id,
+        origin_session_key="",
+        requested_origin_session_key=args.origin_session_key,
+        env=os.environ,
+        delivery_strategy=args.delivery_strategy,
+        supports_hidden_wake=args.supports_hidden_wake,
+        supports_sessions_send=args.supports_sessions_send,
+    )
+    state_path = runtime_config["state_file"]
     watch_state = (
-        load_watch_state(state_path, args.watch_id, target_session_key=args.session_key)
+        load_watch_state(state_path, runtime_config["watch_id"], target_session_key=args.session_key)
         if state_path
-        else WatchState(watch_id=args.watch_id, target_session_key=args.session_key)
+        else WatchState(watch_id=runtime_config["watch_id"], target_session_key=args.session_key)
+    )
+    watch_state = prepare_watch_state(
+        watch_state,
+        target_session_key=args.session_key,
+        origin_session_key=runtime_config["origin_session_key"],
+        requested_strategy=runtime_config["delivery_strategy"],
+        supports_hidden_wake=args.supports_hidden_wake,
+        supports_sessions_send=runtime_config["supports_sessions_send"],
     )
     current_session_key = watch_state.target_session_key or args.session_key
     last_seen = args.since_seq if args.since_seq is not None else watch_state.last_seen_seq
@@ -248,7 +374,16 @@ def main() -> int:
                 min_idle_polls=args.heartbeat_idle_polls,
                 min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
             )
-            emit_batch(batch, jsonl=args.jsonl, stream=sys.stdout)
+            deliver_batch(
+                batch,
+                delivery_strategy=watch_state.delivery_strategy,
+                origin_session_key=watch_state.origin_session_key,
+                url=url,
+                headers=headers,
+                send_fn=invoke_sessions_send,
+                jsonl=args.jsonl,
+                stream=sys.stdout,
+            )
             if state_path:
                 save_watch_state(state_path, watch_state)
         except KeyboardInterrupt:

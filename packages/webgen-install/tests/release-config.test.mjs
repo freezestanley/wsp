@@ -19,4 +19,8 @@ test("release config resolves desktop target and versioned archive name", async 
     config.distArchivePath,
     "/repo/workspace/packages/webgen-install/dist/openclaw-webgen-install-0.1.0.zip",
   );
+  assert.equal(
+    config.distPackagePath,
+    "/repo/workspace/packages/webgen-install/dist/openclaw-webgen-install-0.1.0.tgz",
+  );
 });

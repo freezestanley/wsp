@@ -3,6 +3,9 @@ import unittest
 from pathlib import Path
 
 from runtime.live_watch import (
+    build_watch_bootstrap,
+    build_watch_invocation,
+    prepare_watch_state,
     WatchState,
     build_broadcast_batch,
     maybe_create_heartbeat,
@@ -11,6 +14,7 @@ from runtime.live_watch import (
     record_cycle_state,
     is_internal_prompt_text,
     load_watch_state,
+    resolve_delivery_strategy,
     resolve_visible_wake_state,
     save_watch_state,
     summarize_new_messages,
@@ -45,6 +49,8 @@ class LiveWatchTests(unittest.TestCase):
             original = WatchState(
                 watch_id="watch-2",
                 target_session_key="agent:webgen:proj-ops",
+                origin_session_key="chat:current",
+                delivery_strategy="rebroadcast",
                 last_seen_seq=41,
                 last_broadcast_seq=39,
                 phase="implementing",
@@ -57,6 +63,158 @@ class LiveWatchTests(unittest.TestCase):
             loaded = load_watch_state(path, "watch-2")
 
         self.assertEqual(loaded, original)
+
+    def test_delivery_strategy_prefers_hidden_wake_when_supported(self) -> None:
+        self.assertEqual(
+            resolve_delivery_strategy(
+                requested_strategy="auto",
+                supports_hidden_wake=True,
+                supports_sessions_send=True,
+                origin_session_key="chat:current",
+            ),
+            "hidden_wake",
+        )
+
+    def test_delivery_strategy_uses_rebroadcast_when_hidden_wake_unavailable(self) -> None:
+        self.assertEqual(
+            resolve_delivery_strategy(
+                requested_strategy="auto",
+                supports_hidden_wake=False,
+                supports_sessions_send=True,
+                origin_session_key="chat:current",
+            ),
+            "rebroadcast",
+        )
+
+    def test_delivery_strategy_falls_back_to_manual_pull_without_origin_or_send(self) -> None:
+        self.assertEqual(
+            resolve_delivery_strategy(
+                requested_strategy="auto",
+                supports_hidden_wake=False,
+                supports_sessions_send=False,
+                origin_session_key="",
+            ),
+            "manual_pull",
+        )
+
+    def test_prepare_watch_state_bootstraps_origin_and_rebroadcast_strategy(self) -> None:
+        state = WatchState(
+            watch_id="watch-bootstrap",
+            target_session_key="agent:webgen:proj-demo",
+        )
+
+        updated = prepare_watch_state(
+            state,
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:discord:dm:buddy",
+            requested_strategy="auto",
+            supports_hidden_wake=False,
+            supports_sessions_send=True,
+        )
+
+        self.assertEqual(updated.origin_session_key, "agent:main:discord:dm:buddy")
+        self.assertEqual(updated.delivery_strategy, "rebroadcast")
+
+    def test_prepare_watch_state_preserves_existing_origin_when_new_origin_missing(self) -> None:
+        state = WatchState(
+            watch_id="watch-bootstrap-2",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:telegram:group:-1",
+            delivery_strategy="rebroadcast",
+        )
+
+        updated = prepare_watch_state(
+            state,
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="",
+            requested_strategy="auto",
+            supports_hidden_wake=False,
+            supports_sessions_send=True,
+        )
+
+        self.assertEqual(updated.origin_session_key, "agent:main:telegram:group:-1")
+        self.assertEqual(updated.delivery_strategy, "rebroadcast")
+
+    def test_build_watch_bootstrap_derives_stable_watch_id_and_state_file(self) -> None:
+        bootstrap = build_watch_bootstrap(
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:discord:dm:buddy",
+            requested_strategy="auto",
+            supports_hidden_wake=False,
+            supports_sessions_send=True,
+        )
+
+        self.assertEqual(bootstrap["watch_id"], "watch-agent-webgen-proj-demo")
+        self.assertEqual(bootstrap["delivery_strategy"], "rebroadcast")
+        self.assertEqual(bootstrap["origin_session_key"], "agent:main:discord:dm:buddy")
+        self.assertTrue(str(bootstrap["state_file"]).endswith("/watch-agent-webgen-proj-demo.json"))
+
+    def test_build_watch_bootstrap_respects_explicit_watch_id_and_state_root(self) -> None:
+        bootstrap = build_watch_bootstrap(
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="",
+            requested_strategy="manual_pull",
+            supports_hidden_wake=False,
+            supports_sessions_send=False,
+            watch_id="watch-custom",
+            state_root=Path("/tmp/custom-watch-root"),
+        )
+
+        self.assertEqual(bootstrap["watch_id"], "watch-custom")
+        self.assertEqual(bootstrap["delivery_strategy"], "manual_pull")
+        self.assertEqual(bootstrap["state_file"], Path("/tmp/custom-watch-root/watch-custom.json"))
+
+    def test_build_watch_invocation_uses_bootstrap_and_env_for_origin_session(self) -> None:
+        bootstrap = build_watch_bootstrap(
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:discord:dm:buddy",
+            requested_strategy="auto",
+            supports_hidden_wake=False,
+            supports_sessions_send=True,
+        )
+
+        invocation = build_watch_invocation(bootstrap)
+
+        self.assertEqual(invocation["env"], {"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:discord:dm:buddy"})
+        self.assertEqual(invocation["command"][0], "python3")
+        self.assertEqual(invocation["command"][1], "runtime/live-webgen-progress.py")
+        self.assertEqual(invocation["command"][2], "agent:webgen:proj-demo")
+        self.assertIn("--state-file", invocation["command"])
+        self.assertIn("--watch-id", invocation["command"])
+        self.assertIn("--delivery-strategy", invocation["command"])
+        self.assertIn("rebroadcast", invocation["command"])
+        self.assertNotIn("--origin-session-key", invocation["command"])
+
+    def test_build_watch_invocation_adds_optional_flags_when_requested(self) -> None:
+        bootstrap = build_watch_bootstrap(
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="",
+            requested_strategy="hidden_wake",
+            supports_hidden_wake=True,
+            supports_sessions_send=False,
+            watch_id="watch-custom",
+            state_root=Path("/tmp/custom-watch-root"),
+        )
+
+        invocation = build_watch_invocation(
+            bootstrap,
+            interval=10.0,
+            limit=50,
+            max_items=5,
+            auto_switch_webgen=True,
+            once=True,
+            jsonl=True,
+            supports_hidden_wake=True,
+        )
+
+        self.assertEqual(invocation["env"], {})
+        self.assertIn("--supports-hidden-wake", invocation["command"])
+        self.assertIn("--auto-switch-webgen", invocation["command"])
+        self.assertIn("--once", invocation["command"])
+        self.assertIn("--jsonl", invocation["command"])
+        self.assertIn("10.0", invocation["command"])
+        self.assertIn("50", invocation["command"])
+        self.assertIn("5", invocation["command"])
 
     def test_record_cycle_state_preserves_context_fields(self) -> None:
         state = WatchState(
