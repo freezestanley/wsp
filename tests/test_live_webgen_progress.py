@@ -18,6 +18,164 @@ def load_live_webgen_progress_module():
 
 
 class LiveWebgenProgressTests(unittest.TestCase):
+    def test_run_watch_cycle_startup_resolves_session_file_and_pulls_via_fallback(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "run_watch_cycle"),
+            "run_watch_cycle must be implemented",
+        )
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+        )
+        sample = module.SessionFileSample(
+            path=Path("/tmp/proj-demo.jsonl"),
+            exists=True,
+            mtime=11.0,
+            size=110,
+            inode=2,
+            sampled_at=100.0,
+        )
+
+        updated, last_seen, batch, pulled = module.run_watch_cycle(
+            watch_state=state,
+            current_session_key="agent:webgen:proj-demo",
+            last_seen=-1,
+            now=100.0,
+            limit=30,
+            max_items=3,
+            heartbeat_idle_polls=3,
+            heartbeat_interval_seconds=60.0,
+            fallback_history_interval_seconds=30.0,
+            session_file_resolver=lambda _session_key: Path("/tmp/proj-demo.jsonl"),
+            sample_session_file_fn=lambda _path: sample,
+            invoke_sessions_history_fn=lambda _session_key, _include_tools, _limit: {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "已完成首版实现，正在截图验证"}],
+                        "__openclaw": {"seq": 12},
+                    }
+                ]
+            },
+            debounce_seconds=0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertTrue(pulled)
+        self.assertEqual(updated.session_file_path, "/tmp/proj-demo.jsonl")
+        self.assertEqual(updated.session_file_size, 110)
+        self.assertEqual(updated.last_history_pull_at, 100.0)
+        self.assertEqual(last_seen, 12)
+        self.assertEqual(len(batch), 1)
+        self.assertIn("截图验证", batch[0]["summary"])
+
+    def test_run_watch_cycle_file_change_triggers_history_pull_and_updates_sample(self) -> None:
+        module = load_live_webgen_progress_module()
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            session_file_path="/tmp/proj-demo.jsonl",
+            session_file_mtime=10.0,
+            session_file_size=100,
+            session_file_inode=1,
+            last_history_pull_at=95.0,
+        )
+        changed_sample = module.SessionFileSample(
+            path=Path("/tmp/proj-demo.jsonl"),
+            exists=True,
+            mtime=11.0,
+            size=110,
+            inode=1,
+            sampled_at=100.0,
+        )
+
+        updated, last_seen, batch, pulled = module.run_watch_cycle(
+            watch_state=state,
+            current_session_key="agent:webgen:proj-demo",
+            last_seen=11,
+            now=100.0,
+            limit=30,
+            max_items=3,
+            heartbeat_idle_polls=3,
+            heartbeat_interval_seconds=60.0,
+            fallback_history_interval_seconds=30.0,
+            session_file_resolver=lambda _session_key: Path("/tmp/proj-demo.jsonl"),
+            sample_session_file_fn=lambda _path: changed_sample,
+            invoke_sessions_history_fn=lambda _session_key, _include_tools, _limit: {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "已进入验证阶段，正在截图检查"}],
+                        "__openclaw": {"seq": 12},
+                    }
+                ]
+            },
+            debounce_seconds=0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertTrue(pulled)
+        self.assertEqual(updated.session_file_mtime, 11.0)
+        self.assertEqual(updated.session_file_size, 110)
+        self.assertEqual(updated.last_history_pull_at, 100.0)
+        self.assertEqual(last_seen, 12)
+        self.assertEqual(len(batch), 1)
+        self.assertIn("截图检查", batch[0]["summary"])
+
+    def test_run_watch_cycle_does_not_rebroadcast_when_history_has_no_new_messages(self) -> None:
+        module = load_live_webgen_progress_module()
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            session_file_path="/tmp/proj-demo.jsonl",
+            session_file_mtime=10.0,
+            session_file_size=100,
+            session_file_inode=1,
+            last_history_pull_at=95.0,
+        )
+        changed_sample = module.SessionFileSample(
+            path=Path("/tmp/proj-demo.jsonl"),
+            exists=True,
+            mtime=11.0,
+            size=110,
+            inode=1,
+            sampled_at=100.0,
+        )
+
+        updated, last_seen, batch, pulled = module.run_watch_cycle(
+            watch_state=state,
+            current_session_key="agent:webgen:proj-demo",
+            last_seen=12,
+            now=100.0,
+            limit=30,
+            max_items=3,
+            heartbeat_idle_polls=3,
+            heartbeat_interval_seconds=60.0,
+            fallback_history_interval_seconds=30.0,
+            session_file_resolver=lambda _session_key: Path("/tmp/proj-demo.jsonl"),
+            sample_session_file_fn=lambda _path: changed_sample,
+            invoke_sessions_history_fn=lambda _session_key, _include_tools, _limit: {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "已进入验证阶段，正在截图检查"}],
+                        "__openclaw": {"seq": 12},
+                    }
+                ]
+            },
+            debounce_seconds=0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertTrue(pulled)
+        self.assertEqual(last_seen, 12)
+        self.assertEqual(batch, [])
+        self.assertEqual(updated.last_history_pull_at, 100.0)
+
     def test_resolve_or_refresh_session_file_updates_state_from_resolver(self) -> None:
         module = load_live_webgen_progress_module()
         self.assertTrue(

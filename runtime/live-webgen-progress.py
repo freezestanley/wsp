@@ -33,6 +33,8 @@ from runtime.session_origin import DEFAULT_HTTP_GATEWAY_DENY
 from runtime.session_file_watch import (
     SessionFileSample,
     detect_session_file_change,
+    resolve_session_file_path,
+    sample_session_file,
 )
 
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
@@ -231,6 +233,136 @@ def should_run_fallback_history_pull(
     )
 
 
+def session_file_sample_from_state(state: WatchState) -> SessionFileSample:
+    path = Path(state.session_file_path) if state.session_file_path.strip() else None
+    return SessionFileSample(
+        path=path,
+        exists=bool(path) and (
+            float(state.session_file_mtime) > 0.0
+            or int(state.session_file_size) > 0
+            or int(state.session_file_inode) > 0
+        ),
+        mtime=float(state.session_file_mtime),
+        size=int(state.session_file_size),
+        inode=int(state.session_file_inode),
+        sampled_at=float(state.last_session_event_at),
+    )
+
+
+def apply_session_file_sample(
+    state: WatchState,
+    sample: SessionFileSample,
+    *,
+    event_at: float | None = None,
+) -> WatchState:
+    return replace(
+        state,
+        session_file_path=str(sample.path) if sample.path is not None else "",
+        session_file_mtime=float(sample.mtime),
+        session_file_size=int(sample.size),
+        session_file_inode=int(sample.inode),
+        last_session_event_at=float(sample.sampled_at if event_at is None else event_at),
+    )
+
+
+def run_watch_cycle(
+    *,
+    watch_state: WatchState,
+    current_session_key: str,
+    last_seen: int,
+    now: float,
+    limit: int,
+    max_items: int,
+    heartbeat_idle_polls: int,
+    heartbeat_interval_seconds: float,
+    fallback_history_interval_seconds: float,
+    session_file_resolver,
+    sample_session_file_fn,
+    invoke_sessions_history_fn,
+    debounce_seconds: float = 0.0,
+    sleep_fn=time.sleep,
+    context_usage_ratio: float | None = None,
+    context_nudge_cooldown_seconds: float = 300.0,
+) -> tuple[WatchState, int, list[dict[str, Any]], bool]:
+    updated_state = watch_state
+    if (
+        updated_state.target_session_key != current_session_key
+        or not updated_state.session_file_path.strip()
+    ):
+        updated_state = resolve_or_refresh_session_file(
+            updated_state,
+            session_key=current_session_key,
+            resolver=session_file_resolver,
+        )
+
+    previous_sample = session_file_sample_from_state(updated_state)
+    sample_path = Path(updated_state.session_file_path) if updated_state.session_file_path.strip() else None
+    current_sample = sample_session_file_fn(sample_path)
+    file_changed = should_pull_history_from_file_event(previous_sample, current_sample)
+
+    if file_changed and debounce_seconds > 0.0:
+        sleep_fn(debounce_seconds)
+        current_sample = sample_session_file_fn(sample_path)
+
+    updated_state = apply_session_file_sample(
+        updated_state,
+        current_sample,
+        event_at=now if file_changed else updated_state.last_session_event_at,
+    )
+    updated_state = replace(
+        updated_state,
+        target_session_key=current_session_key,
+    )
+
+    should_pull = file_changed or should_run_fallback_history_pull(
+        updated_state,
+        now=now,
+        fallback_history_interval_seconds=fallback_history_interval_seconds,
+    )
+    if not should_pull:
+        updated_state = record_cycle_state(updated_state, [], now)
+        batch, updated_state = build_broadcast_batch(
+            updated_state,
+            [],
+            now,
+            max_items=max_items,
+            min_idle_polls=heartbeat_idle_polls,
+            min_heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+        return updated_state, last_seen, batch, False
+
+    history = invoke_sessions_history_fn(current_session_key, True, limit)
+    messages = history.get("messages", [])
+    items, new_last_seen = summarize_new_messages(
+        messages,
+        last_seen,
+        current_session_key,
+        max_items=max_items,
+    )
+    updated_state = replace(
+        updated_state,
+        last_seen_seq=new_last_seen,
+        last_history_pull_at=now,
+    )
+    updated_state = record_cycle_state(updated_state, items, now)
+    _silent_nudge, updated_state = evaluate_silent_context_nudge_cycle(
+        updated_state,
+        items=items,
+        now=now,
+        context_usage_ratio=context_usage_ratio,
+        cooldown_seconds=context_nudge_cooldown_seconds,
+    )
+    batch, updated_state = build_broadcast_batch(
+        updated_state,
+        items,
+        now,
+        max_items=max_items,
+        min_idle_polls=heartbeat_idle_polls,
+        min_heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
+    return updated_state, new_last_seen, batch, True
+
+
 def emit_batch(batch: list[dict[str, Any]], *, jsonl: bool, stream: TextIO) -> None:
     for item in batch:
         if jsonl:
@@ -379,6 +511,13 @@ def main() -> int:
     parser.add_argument('--delivery-strategy', default='auto', choices=['auto', 'hidden_wake', 'rebroadcast', 'manual_pull'], help='直播投递策略，默认 auto')
     parser.add_argument('--supports-hidden-wake', action='store_true', help='声明当前实例支持 hidden/internal wake')
     parser.add_argument('--supports-sessions-send', action='store_true', help='声明当前实例支持 sessions_send 回推')
+    parser.add_argument('--debounce-ms', type=int, default=0, help='session 文件变化后的去抖毫秒数')
+    parser.add_argument(
+        '--fallback-history-interval-seconds',
+        type=float,
+        default=None,
+        help='文件无变化时的 history 兜底拉取间隔秒数',
+    )
     parser.add_argument('--lease-seconds', type=float, default=30.0, help='worker lease 保持秒数，默认 30')
     parser.add_argument('--idle-exit-polls', type=int, default=4, help='连续空轮询多少次后 worker 主动退出，默认 4')
     parser.add_argument('--worker-id', default='', help='可选：显式指定 worker 标识')
@@ -458,9 +597,6 @@ def main() -> int:
                     else:
                         print(f'🔀 已切换直播目标 session：{current_session_key}', flush=True)
 
-            history = invoke_sessions_history(url, headers, current_session_key, True, args.limit)
-            messages = history.get('messages', [])
-            items, last_seen = summarize_new_messages(messages, last_seen, current_session_key, max_items=args.max_items)
             now = time.time()
             watch_state = claim_worker_lease(
                 watch_state,
@@ -468,26 +604,33 @@ def main() -> int:
                 now=now,
                 lease_seconds=args.lease_seconds,
             )
-            watch_state = replace(
-                watch_state,
-                target_session_key=current_session_key,
-                last_seen_seq=last_seen,
-            )
-            watch_state = record_cycle_state(watch_state, items, now)
-            _silent_nudge, watch_state = evaluate_silent_context_nudge_cycle(
-                watch_state,
-                items=items,
+            watch_state, last_seen, batch, _pulled = run_watch_cycle(
+                watch_state=watch_state,
+                current_session_key=current_session_key,
+                last_seen=last_seen,
                 now=now,
-                context_usage_ratio=context_usage_ratio,
-                cooldown_seconds=context_nudge_cooldown_seconds,
-            )
-            batch, watch_state = build_broadcast_batch(
-                watch_state,
-                items,
-                now,
+                limit=args.limit,
                 max_items=args.max_items,
-                min_idle_polls=args.heartbeat_idle_polls,
-                min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+                heartbeat_idle_polls=args.heartbeat_idle_polls,
+                heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+                fallback_history_interval_seconds=(
+                    args.fallback_history_interval_seconds
+                    if args.fallback_history_interval_seconds is not None
+                    else args.interval
+                ),
+                session_file_resolver=resolve_session_file_path,
+                sample_session_file_fn=sample_session_file,
+                invoke_sessions_history_fn=lambda session_key, include_tools, limit: invoke_sessions_history(
+                    url,
+                    headers,
+                    session_key,
+                    include_tools,
+                    limit,
+                ),
+                debounce_seconds=max(float(args.debounce_ms), 0.0) / 1000.0,
+                sleep_fn=time.sleep,
+                context_usage_ratio=context_usage_ratio,
+                context_nudge_cooldown_seconds=context_nudge_cooldown_seconds,
             )
             try:
                 delivered = deliver_batch(
