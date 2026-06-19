@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
+import json
 import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 from typing import Any, TextIO
@@ -16,6 +17,7 @@ if __package__ in (None, ''):
 from runtime.live_watch import (
     build_broadcast_batch,
     build_watch_bootstrap,
+    needs_final_delivery,
     prepare_watch_state,
     WatchState,
     load_watch_state,
@@ -27,17 +29,13 @@ from runtime.live_watch import (
 from runtime.context_nudge import clear_context_ack, maybe_plan_hidden_context_nudge
 from runtime.context_stopgap import compaction_band_for_ratio
 from runtime.context_stopgap import truncate_tool_output
+from runtime.session_origin import DEFAULT_HTTP_GATEWAY_DENY
+from runtime.session_file_watch import (
+    SessionFileSample,
+    detect_session_file_change,
+)
 
 CFG_PATH = Path(os.environ.get('OPENCLAW_CONFIG_PATH', '/Users/za-stanlexu/.openclaw/openclaw.json'))
-DEFAULT_HTTP_GATEWAY_DENY = {
-    'sessions_spawn',
-    'sessions_send',
-    'cron',
-    'gateway',
-    'whatsapp_login',
-}
-
-
 def load_config() -> dict[str, Any]:
     with CFG_PATH.open('r', encoding='utf-8') as f:
         return json.load(f)
@@ -201,6 +199,38 @@ def sanitize_context_nudge_cooldown_seconds(raw_cooldown: float) -> float:
     return cooldown
 
 
+def resolve_or_refresh_session_file(
+    state: WatchState,
+    *,
+    session_key: str,
+    resolver,
+) -> WatchState:
+    resolved = resolver(session_key)
+    return replace(
+        state,
+        session_file_path=str(resolved) if resolved is not None else "",
+    )
+
+
+def should_pull_history_from_file_event(
+    previous_sample: SessionFileSample,
+    current_sample: SessionFileSample,
+) -> bool:
+    return detect_session_file_change(previous_sample, current_sample)
+
+
+def should_run_fallback_history_pull(
+    state: WatchState,
+    *,
+    now: float,
+    fallback_history_interval_seconds: float,
+) -> bool:
+    return (float(now) - float(state.last_history_pull_at)) >= max(
+        float(fallback_history_interval_seconds),
+        1.0,
+    )
+
+
 def emit_batch(batch: list[dict[str, Any]], *, jsonl: bool, stream: TextIO) -> None:
     for item in batch:
         if jsonl:
@@ -221,6 +251,50 @@ def render_batch_text(batch: list[dict[str, Any]]) -> str:
     )
 
 
+def claim_worker_lease(
+    state: WatchState,
+    *,
+    worker_id: str,
+    now: float,
+    lease_seconds: float,
+) -> WatchState:
+    safe_lease_seconds = max(float(lease_seconds), 1.0)
+    return replace(
+        state,
+        status="running",
+        lease_owner=worker_id.strip(),
+        lease_until=now + safe_lease_seconds,
+        last_worker_heartbeat_at=now,
+    )
+
+
+def record_delivery_outcome(
+    state: WatchState,
+    *,
+    batch: list[dict[str, Any]],
+    delivered: bool,
+) -> WatchState:
+    if not batch:
+        return state
+    terminal_summary = ""
+    for item in reversed(batch):
+        summary = str(item.get("summary", "")).strip()
+        if summary:
+            terminal_summary = summary
+            break
+    if not terminal_summary or not needs_final_delivery(state):
+        return state
+    return replace(
+        state,
+        final_summary=terminal_summary,
+        final_delivered=bool(delivered),
+    )
+
+
+def should_exit_worker(state: WatchState, *, idle_exit_polls: int) -> bool:
+    return state.idle_poll_count >= max(int(idle_exit_polls), 1) and not needs_final_delivery(state)
+
+
 def deliver_batch(
     batch: list[dict[str, Any]],
     *,
@@ -239,6 +313,25 @@ def deliver_batch(
             return True
     emit_batch(batch, jsonl=jsonl, stream=stream)
     return False
+
+
+def is_sessions_send_unavailable_error(error: Exception) -> bool:
+    return "tool not available: sessions_send" in str(error).lower()
+
+
+def handle_delivery_failure(state: WatchState, error: Exception) -> WatchState | None:
+    if state.delivery_strategy != "rebroadcast":
+        return None
+    if not is_sessions_send_unavailable_error(error):
+        return None
+    return replace(
+        state,
+        delivery_strategy="manual_pull",
+        pending_control_summary=(
+            "⚠️ 自动回推失败：当前 watcher 运行环境不可用 sessions_send，"
+            "已降级为 manual_pull。"
+        ),
+    )
 
 
 def evaluate_silent_context_nudge_cycle(
@@ -286,6 +379,9 @@ def main() -> int:
     parser.add_argument('--delivery-strategy', default='auto', choices=['auto', 'hidden_wake', 'rebroadcast', 'manual_pull'], help='直播投递策略，默认 auto')
     parser.add_argument('--supports-hidden-wake', action='store_true', help='声明当前实例支持 hidden/internal wake')
     parser.add_argument('--supports-sessions-send', action='store_true', help='声明当前实例支持 sessions_send 回推')
+    parser.add_argument('--lease-seconds', type=float, default=30.0, help='worker lease 保持秒数，默认 30')
+    parser.add_argument('--idle-exit-polls', type=int, default=4, help='连续空轮询多少次后 worker 主动退出，默认 4')
+    parser.add_argument('--worker-id', default='', help='可选：显式指定 worker 标识')
     args = parser.parse_args()
     context_usage_ratio = normalize_context_usage_ratio(args.context_usage_ratio)
     context_nudge_cooldown_seconds = sanitize_context_nudge_cooldown_seconds(args.context_nudge_cooldown_seconds)
@@ -318,6 +414,16 @@ def main() -> int:
         supports_hidden_wake=args.supports_hidden_wake,
         supports_sessions_send=runtime_config["supports_sessions_send"],
     )
+    worker_id = args.worker_id.strip() or f"worker-{os.getpid()}"
+    startup_now = time.time()
+    watch_state = claim_worker_lease(
+        watch_state,
+        worker_id=worker_id,
+        now=startup_now,
+        lease_seconds=args.lease_seconds,
+    )
+    if state_path:
+        save_watch_state(state_path, watch_state)
     current_session_key = watch_state.target_session_key or args.session_key
     last_seen = args.since_seq if args.since_seq is not None else watch_state.last_seen_seq
 
@@ -356,8 +462,17 @@ def main() -> int:
             messages = history.get('messages', [])
             items, last_seen = summarize_new_messages(messages, last_seen, current_session_key, max_items=args.max_items)
             now = time.time()
-            watch_state.target_session_key = current_session_key
-            watch_state.last_seen_seq = last_seen
+            watch_state = claim_worker_lease(
+                watch_state,
+                worker_id=worker_id,
+                now=now,
+                lease_seconds=args.lease_seconds,
+            )
+            watch_state = replace(
+                watch_state,
+                target_session_key=current_session_key,
+                last_seen_seq=last_seen,
+            )
             watch_state = record_cycle_state(watch_state, items, now)
             _silent_nudge, watch_state = evaluate_silent_context_nudge_cycle(
                 watch_state,
@@ -374,18 +489,33 @@ def main() -> int:
                 min_idle_polls=args.heartbeat_idle_polls,
                 min_heartbeat_interval_seconds=args.heartbeat_interval_seconds,
             )
-            deliver_batch(
-                batch,
-                delivery_strategy=watch_state.delivery_strategy,
-                origin_session_key=watch_state.origin_session_key,
-                url=url,
-                headers=headers,
-                send_fn=invoke_sessions_send,
-                jsonl=args.jsonl,
-                stream=sys.stdout,
+            try:
+                delivered = deliver_batch(
+                    batch,
+                    delivery_strategy=watch_state.delivery_strategy,
+                    origin_session_key=watch_state.origin_session_key,
+                    url=url,
+                    headers=headers,
+                    send_fn=invoke_sessions_send,
+                    jsonl=args.jsonl,
+                    stream=sys.stdout,
+                )
+            except Exception as e:
+                recovered_state = handle_delivery_failure(watch_state, e)
+                if recovered_state is None:
+                    raise
+                watch_state = recovered_state
+                emit_batch(batch, jsonl=args.jsonl, stream=sys.stdout)
+                delivered = False
+            watch_state = record_delivery_outcome(
+                watch_state,
+                batch=batch,
+                delivered=delivered or watch_state.delivery_strategy != "rebroadcast",
             )
             if state_path:
                 save_watch_state(state_path, watch_state)
+            if should_exit_worker(watch_state, idle_exit_polls=args.idle_exit_polls):
+                return 0
         except KeyboardInterrupt:
             return 130
         except urllib.error.HTTPError as e:

@@ -17,6 +17,10 @@ class WatchState:
     target_session_key: str
     origin_session_key: str = ""
     delivery_strategy: str = "hidden_wake"
+    status: str = "pending"
+    lease_owner: str = ""
+    lease_until: float = 0.0
+    last_worker_heartbeat_at: float = 0.0
     last_seen_seq: int = -1
     last_broadcast_seq: int = -1
     phase: str = "implementing"
@@ -28,6 +32,33 @@ class WatchState:
     last_context_band: str = "ok"
     last_context_nudge_at: float = 0.0
     awaiting_context_ack: bool = False
+    final_delivered: bool = False
+    final_summary: str = ""
+    needs_rechain: bool = False
+    rechain_reason: str = ""
+    session_file_path: str = ""
+    session_file_mtime: float = 0.0
+    session_file_size: int = 0
+    session_file_inode: int = 0
+    last_session_event_at: float = 0.0
+    last_history_pull_at: float = 0.0
+
+
+def is_terminal_watch(state: WatchState) -> bool:
+    return state.status in {"done", "blocked", "canceled"} or state.phase in {
+        "done",
+        "blocked",
+        "canceled",
+        "waiting_user",
+    }
+
+
+def has_active_lease(state: WatchState, *, now: float) -> bool:
+    return bool(state.lease_owner.strip()) and float(state.lease_until) > now
+
+
+def needs_final_delivery(state: WatchState) -> bool:
+    return is_terminal_watch(state) and not state.final_delivered
 
 
 def _replace_state(state: WatchState, **changes: Any) -> WatchState:
@@ -59,6 +90,10 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
         target_session_key=str(raw.get("target_session_key") or target_session_key or ""),
         origin_session_key=str(raw.get("origin_session_key") or ""),
         delivery_strategy=str(raw.get("delivery_strategy") or "hidden_wake"),
+        status=str(raw.get("status") or "pending"),
+        lease_owner=str(raw.get("lease_owner") or ""),
+        lease_until=float(raw.get("lease_until", 0.0)),
+        last_worker_heartbeat_at=float(raw.get("last_worker_heartbeat_at", 0.0)),
         last_seen_seq=int(raw.get("last_seen_seq", -1)),
         last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
         phase=str(raw.get("phase", "implementing")),
@@ -70,6 +105,16 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
         last_context_band=str(raw.get("last_context_band", "ok")),
         last_context_nudge_at=float(raw.get("last_context_nudge_at", 0.0)),
         awaiting_context_ack=bool(raw.get("awaiting_context_ack", False)),
+        final_delivered=bool(raw.get("final_delivered", False)),
+        final_summary=str(raw.get("final_summary", "")),
+        needs_rechain=bool(raw.get("needs_rechain", False)),
+        rechain_reason=str(raw.get("rechain_reason", "")),
+        session_file_path=str(raw.get("session_file_path", "")),
+        session_file_mtime=float(raw.get("session_file_mtime", 0.0)),
+        session_file_size=int(raw.get("session_file_size", 0)),
+        session_file_inode=int(raw.get("session_file_inode", 0)),
+        last_session_event_at=float(raw.get("last_session_event_at", 0.0)),
+        last_history_pull_at=float(raw.get("last_history_pull_at", 0.0)),
     )
 
 
@@ -95,6 +140,10 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
                 target_session_key=str(raw.get("target_session_key") or ""),
                 origin_session_key=str(raw.get("origin_session_key") or ""),
                 delivery_strategy=str(raw.get("delivery_strategy") or "hidden_wake"),
+                status=str(raw.get("status") or "pending"),
+                lease_owner=str(raw.get("lease_owner") or ""),
+                lease_until=float(raw.get("lease_until", 0.0)),
+                last_worker_heartbeat_at=float(raw.get("last_worker_heartbeat_at", 0.0)),
                 last_seen_seq=int(raw.get("last_seen_seq", -1)),
                 last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
                 phase=str(raw.get("phase", "implementing")),
@@ -106,6 +155,16 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
                 last_context_band=str(raw.get("last_context_band", "ok")),
                 last_context_nudge_at=float(raw.get("last_context_nudge_at", 0.0)),
                 awaiting_context_ack=bool(raw.get("awaiting_context_ack", False)),
+                final_delivered=bool(raw.get("final_delivered", False)),
+                final_summary=str(raw.get("final_summary", "")),
+                needs_rechain=bool(raw.get("needs_rechain", False)),
+                rechain_reason=str(raw.get("rechain_reason", "")),
+                session_file_path=str(raw.get("session_file_path", "")),
+                session_file_mtime=float(raw.get("session_file_mtime", 0.0)),
+                session_file_size=int(raw.get("session_file_size", 0)),
+                session_file_inode=int(raw.get("session_file_inode", 0)),
+                last_session_event_at=float(raw.get("last_session_event_at", 0.0)),
+                last_history_pull_at=float(raw.get("last_history_pull_at", 0.0)),
             )
         )
 
@@ -114,7 +173,7 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
 
     active_candidates = [
         state for state in candidates
-        if state.phase not in {"done", "blocked", "canceled", "waiting_user"}
+        if not is_terminal_watch(state)
     ]
     pool = active_candidates or candidates
     pool.sort(
@@ -259,6 +318,61 @@ def build_watch_invocation(
     }
 
 
+def build_rechain_invocation(
+    state: WatchState,
+    *,
+    state_file: Path,
+    python_bin: str = "python3",
+    script_path: str = "runtime/live-webgen-progress.py",
+    interval: float = 5.0,
+    limit: int = 30,
+    max_items: int = 3,
+) -> dict[str, Any] | None:
+    if not state.needs_rechain:
+        return None
+    bootstrap = {
+        "watch_id": state.watch_id,
+        "state_file": state_file,
+        "target_session_key": state.target_session_key,
+        "origin_session_key": state.origin_session_key,
+        "delivery_strategy": state.delivery_strategy,
+    }
+    invocation = build_watch_invocation(
+        bootstrap,
+        python_bin=python_bin,
+        script_path=script_path,
+        interval=interval,
+        limit=limit,
+        max_items=max_items,
+        supports_hidden_wake=state.delivery_strategy == "hidden_wake",
+    )
+    invocation["reason"] = state.rechain_reason
+    return invocation
+
+
+def load_rechain_invocation(
+    *,
+    state_file: Path,
+    watch_id: str,
+    target_session_key: str | None = None,
+    python_bin: str = "python3",
+    script_path: str = "runtime/live-webgen-progress.py",
+    interval: float = 5.0,
+    limit: int = 30,
+    max_items: int = 3,
+) -> dict[str, Any] | None:
+    state = load_watch_state(state_file, watch_id, target_session_key=target_session_key)
+    return build_rechain_invocation(
+        state,
+        state_file=state_file,
+        python_bin=python_bin,
+        script_path=script_path,
+        interval=interval,
+        limit=limit,
+        max_items=max_items,
+    )
+
+
 def message_seq(msg: dict[str, Any], fallback: int) -> int:
     oc = msg.get("__openclaw") or {}
     seq = oc.get("seq")
@@ -320,9 +434,15 @@ def is_internal_prompt_text(text: str) -> bool:
     return False
 
 
+def is_cron_restricted_error_text(text: str) -> bool:
+    return "cron tool is restricted to the current cron job." in text.lower()
+
+
 def summarize_tool_result(tool_name: str, text: str, is_error: bool) -> str:
     t = text.lower()
     if is_error:
+        if is_cron_restricted_error_text(text):
+            return "♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。"
         return f"❌ {tool_name} 报错：{single_line(text, 110)}"
     if tool_name == "exec":
         if "error" in t or "failed" in t or "command not found" in t or "traceback" in t:
@@ -454,14 +574,37 @@ def infer_phase_from_summary(summary: str, fallback: str) -> str:
     return fallback
 
 
+def infer_status_from_phase(phase: str, fallback: str) -> str:
+    if phase == "done":
+        return "done"
+    if phase == "blocked":
+        return "blocked"
+    if phase == "canceled":
+        return "canceled"
+    if phase in {"implementing", "verifying", "discovery", "waiting_user"}:
+        return "running"
+    return fallback
+
+
 def record_cycle_state(state: WatchState, items: list[dict[str, Any]], now: float) -> WatchState:
     if items:
         latest = items[-1]
         latest_summary = str(latest.get("summary", ""))
+        if is_cron_restricted_error_text(latest_summary) or "待补链" in latest_summary:
+            return _replace_state(
+                state,
+                last_broadcast_seq=int(latest.get("seq", state.last_broadcast_seq)),
+                idle_poll_count=0,
+                needs_rechain=True,
+                rechain_reason=latest_summary,
+                pending_control_summary="⚠️ 当前回合处于 cron 受限态，已标记待补链，需在下一次普通用户回合补链。",
+            )
+        inferred_phase = infer_phase_from_summary(latest_summary, state.phase)
         return _replace_state(
             state,
             last_broadcast_seq=int(latest.get("seq", state.last_broadcast_seq)),
-            phase=infer_phase_from_summary(latest_summary, state.phase),
+            phase=inferred_phase,
+            status=infer_status_from_phase(inferred_phase, state.status),
             idle_poll_count=0,
             last_progress_summary=latest_summary,
         )
@@ -540,6 +683,8 @@ def maybe_take_control_event(state: WatchState) -> tuple[dict[str, Any] | None, 
     updated = _replace_state(
         state,
         pending_control_summary="",
+        needs_rechain=False if state.needs_rechain else state.needs_rechain,
+        rechain_reason="" if state.needs_rechain else state.rechain_reason,
     )
     return item, updated
 

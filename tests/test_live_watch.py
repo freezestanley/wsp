@@ -5,15 +5,21 @@ from pathlib import Path
 from runtime.live_watch import (
     build_watch_bootstrap,
     build_watch_invocation,
+    build_rechain_invocation,
+    load_rechain_invocation,
     prepare_watch_state,
     WatchState,
     build_broadcast_batch,
+    is_cron_restricted_error_text,
     maybe_create_heartbeat,
     maybe_take_control_event,
     record_control_event,
     record_cycle_state,
     is_internal_prompt_text,
+    has_active_lease,
+    is_terminal_watch,
     load_watch_state,
+    needs_final_delivery,
     resolve_delivery_strategy,
     resolve_visible_wake_state,
     save_watch_state,
@@ -57,12 +63,82 @@ class LiveWatchTests(unittest.TestCase):
                 last_context_band="compact",
                 last_context_nudge_at=123.0,
                 awaiting_context_ack=True,
+                status="running",
+                lease_owner="worker-1",
+                lease_until=456.0,
+                last_worker_heartbeat_at=455.0,
+                final_delivered=True,
+                final_summary="✅ 已完成最终交付",
+                session_file_path="/tmp/session.jsonl",
+                session_file_mtime=789.0,
+                session_file_size=321,
+                session_file_inode=654,
+                last_session_event_at=790.0,
+                last_history_pull_at=791.0,
             )
 
             save_watch_state(path, original)
             loaded = load_watch_state(path, "watch-2")
 
         self.assertEqual(loaded, original)
+
+    def test_load_missing_new_state_fields_keeps_backward_compatible_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "watch-state.json"
+            path.write_text(
+                """
+{
+  "watches": {
+    "watch-legacy": {
+      "watch_id": "watch-legacy",
+      "target_session_key": "agent:webgen:proj-legacy",
+      "phase": "implementing"
+    }
+  }
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_watch_state(path, "watch-legacy")
+
+        self.assertEqual(loaded.status, "pending")
+        self.assertEqual(loaded.lease_owner, "")
+        self.assertEqual(loaded.lease_until, 0.0)
+        self.assertEqual(loaded.last_worker_heartbeat_at, 0.0)
+        self.assertFalse(loaded.final_delivered)
+        self.assertEqual(loaded.final_summary, "")
+
+    def test_has_active_lease_respects_expiry(self) -> None:
+        active = WatchState(
+            watch_id="watch-lease-active",
+            target_session_key="agent:webgen:proj-demo",
+            lease_owner="worker-1",
+            lease_until=150.0,
+        )
+        expired = WatchState(
+            watch_id="watch-lease-expired",
+            target_session_key="agent:webgen:proj-demo",
+            lease_owner="worker-2",
+            lease_until=90.0,
+        )
+
+        self.assertTrue(has_active_lease(active, now=100.0))
+        self.assertFalse(has_active_lease(expired, now=100.0))
+
+    def test_terminal_and_final_delivery_helpers_cover_done_state(self) -> None:
+        state = WatchState(
+            watch_id="watch-final",
+            target_session_key="agent:webgen:proj-demo",
+            status="done",
+            phase="done",
+            final_delivered=False,
+            final_summary="✅ 已完成最终交付",
+        )
+
+        self.assertTrue(is_terminal_watch(state))
+        self.assertTrue(needs_final_delivery(state))
 
     def test_delivery_strategy_prefers_hidden_wake_when_supported(self) -> None:
         self.assertEqual(
@@ -216,6 +292,75 @@ class LiveWatchTests(unittest.TestCase):
         self.assertIn("50", invocation["command"])
         self.assertIn("5", invocation["command"])
 
+    def test_build_rechain_invocation_returns_none_when_not_needed(self) -> None:
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            phase="implementing",
+        )
+
+        invocation = build_rechain_invocation(
+            state,
+            state_file=Path("/tmp/openclaw-live-watch/watch-demo.json"),
+        )
+
+        self.assertIsNone(invocation)
+
+    def test_build_rechain_invocation_uses_state_to_resume_watch(self) -> None:
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:discord:dm:buddy",
+            delivery_strategy="rebroadcast",
+            phase="verifying",
+            needs_rechain=True,
+            rechain_reason="♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。",
+        )
+
+        invocation = build_rechain_invocation(
+            state,
+            state_file=Path("/tmp/openclaw-live-watch/watch-demo.json"),
+        )
+
+        self.assertIsNotNone(invocation)
+        assert invocation is not None
+        self.assertEqual(invocation["reason"], state.rechain_reason)
+        self.assertEqual(invocation["env"], {"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:discord:dm:buddy"})
+        self.assertEqual(invocation["command"][0], "python3")
+        self.assertEqual(invocation["command"][2], "agent:webgen:proj-demo")
+        self.assertIn("--state-file", invocation["command"])
+        self.assertIn("/tmp/openclaw-live-watch/watch-demo.json", invocation["command"])
+        self.assertIn("--watch-id", invocation["command"])
+        self.assertIn("watch-demo", invocation["command"])
+        self.assertIn("--delivery-strategy", invocation["command"])
+        self.assertIn("rebroadcast", invocation["command"])
+
+    def test_load_rechain_invocation_reads_state_file_and_returns_resume_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "watch-demo.json"
+            save_watch_state(
+                state_file,
+                WatchState(
+                    watch_id="watch-demo",
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    delivery_strategy="rebroadcast",
+                    phase="verifying",
+                    needs_rechain=True,
+                    rechain_reason="♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。",
+                ),
+            )
+
+            invocation = load_rechain_invocation(
+                state_file=state_file,
+                watch_id="watch-demo",
+            )
+
+        self.assertIsNotNone(invocation)
+        assert invocation is not None
+        self.assertEqual(invocation["reason"], "♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。")
+        self.assertIn(str(state_file), invocation["command"])
+
     def test_record_cycle_state_preserves_context_fields(self) -> None:
         state = WatchState(
             watch_id="watch-2b",
@@ -264,6 +409,15 @@ class LiveWatchTests(unittest.TestCase):
             )
         )
         self.assertFalse(is_internal_prompt_text("webgen 正在跑 pnpm build"))
+
+    def test_cron_restricted_error_text_is_detected(self) -> None:
+        self.assertTrue(
+            is_cron_restricted_error_text("Cron tool is restricted to the current cron job.")
+        )
+        self.assertTrue(
+            is_cron_restricted_error_text("❌ cron 报错：Cron tool is restricted to the current cron job.")
+        )
+        self.assertFalse(is_cron_restricted_error_text("❌ cron 报错：unknown cron job id"))
 
     def test_wake_token_round_trip(self) -> None:
         token = encode_wake_token(
@@ -465,6 +619,51 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(updated.idle_poll_count, 0)
         self.assertEqual(updated.last_broadcast_seq, 12)
         self.assertEqual(updated.last_progress_summary, "✅ 构建成功：vite build")
+
+    def test_record_cycle_state_marks_rechain_instead_of_blocking_on_cron_restricted_error(self) -> None:
+        state = WatchState(
+            watch_id="watch-cron-restricted",
+            target_session_key="agent:webgen:proj-demo",
+            phase="verifying",
+        )
+        items = [
+            {
+                "seq": 12,
+                "summary": "♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。",
+            }
+        ]
+
+        updated = record_cycle_state(state, items, now=100.0)
+
+        self.assertEqual(updated.phase, "verifying")
+        self.assertTrue(updated.needs_rechain)
+        self.assertIn("待补链", updated.rechain_reason)
+        self.assertIn("待补链", updated.pending_control_summary)
+
+    def test_build_broadcast_batch_emits_rechain_notice_once(self) -> None:
+        state = WatchState(
+            watch_id="watch-cron-restricted-2",
+            target_session_key="agent:webgen:proj-demo",
+            phase="implementing",
+            needs_rechain=True,
+            rechain_reason="♻️ cron 受限：当前回合只能操作当前 cron job，已标记待补链。",
+            pending_control_summary="⚠️ 当前回合处于 cron 受限态，已标记待补链，需在下一次普通用户回合补链。",
+        )
+
+        batch, updated = build_broadcast_batch(
+            state,
+            [],
+            now=100.0,
+            max_items=3,
+            min_idle_polls=3,
+            min_heartbeat_interval_seconds=60.0,
+        )
+
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0]["kind"], "control")
+        self.assertIn("待补链", batch[0]["summary"])
+        self.assertFalse(updated.needs_rechain)
+        self.assertEqual(updated.pending_control_summary, "")
 
     def test_record_cycle_state_increments_idle_counter_without_progress(self) -> None:
         state = WatchState(

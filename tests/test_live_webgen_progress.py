@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,181 @@ def load_live_webgen_progress_module():
 
 
 class LiveWebgenProgressTests(unittest.TestCase):
+    def test_resolve_or_refresh_session_file_updates_state_from_resolver(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "resolve_or_refresh_session_file"),
+            "resolve_or_refresh_session_file must be implemented",
+        )
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+        )
+
+        updated = module.resolve_or_refresh_session_file(
+            state,
+            session_key="agent:webgen:proj-demo",
+            resolver=lambda session_key: Path(f"/tmp/{session_key.split(':')[-1]}.jsonl"),
+        )
+
+        self.assertEqual(updated.session_file_path, "/tmp/proj-demo.jsonl")
+
+    def test_should_pull_history_from_file_event_detects_changed_sample(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "should_pull_history_from_file_event"),
+            "should_pull_history_from_file_event must be implemented",
+        )
+
+        previous = module.SessionFileSample(
+            path=Path("/tmp/demo.jsonl"),
+            exists=True,
+            mtime=10.0,
+            size=100,
+            inode=1,
+            sampled_at=20.0,
+        )
+        current = module.SessionFileSample(
+            path=Path("/tmp/demo.jsonl"),
+            exists=True,
+            mtime=11.0,
+            size=110,
+            inode=1,
+            sampled_at=21.0,
+        )
+
+        self.assertTrue(module.should_pull_history_from_file_event(previous, current))
+        self.assertFalse(module.should_pull_history_from_file_event(current, current))
+
+    def test_should_run_fallback_history_pull_respects_interval(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "should_run_fallback_history_pull"),
+            "should_run_fallback_history_pull must be implemented",
+        )
+
+        stale = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            last_history_pull_at=50.0,
+        )
+        fresh = WatchState(
+            watch_id="watch-webgen-fresh",
+            target_session_key="agent:webgen:proj-demo",
+            last_history_pull_at=95.0,
+        )
+
+        self.assertTrue(
+            module.should_run_fallback_history_pull(
+                stale,
+                now=100.0,
+                fallback_history_interval_seconds=30.0,
+            )
+        )
+        self.assertFalse(
+            module.should_run_fallback_history_pull(
+                fresh,
+                now=100.0,
+                fallback_history_interval_seconds=30.0,
+            )
+        )
+
+    def test_claim_worker_lease_marks_running_and_sets_expiry(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "claim_worker_lease"),
+            "claim_worker_lease must be implemented",
+        )
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            status="pending",
+        )
+
+        updated = module.claim_worker_lease(
+            state,
+            worker_id="worker-1",
+            now=100.0,
+            lease_seconds=30.0,
+        )
+
+        self.assertEqual(updated.status, "running")
+        self.assertEqual(updated.lease_owner, "worker-1")
+        self.assertEqual(updated.lease_until, 130.0)
+        self.assertEqual(updated.last_worker_heartbeat_at, 100.0)
+
+    def test_record_delivery_outcome_marks_terminal_summary_delivered_after_rebroadcast(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "record_delivery_outcome"),
+            "record_delivery_outcome must be implemented",
+        )
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            status="done",
+            phase="done",
+            final_delivered=False,
+        )
+
+        updated = module.record_delivery_outcome(
+            state,
+            batch=[{"kind": "assistant", "summary": "✅ 已完成最终交付"}],
+            delivered=True,
+        )
+
+        self.assertTrue(updated.final_delivered)
+        self.assertEqual(updated.final_summary, "✅ 已完成最终交付")
+
+    def test_record_delivery_outcome_keeps_terminal_summary_pending_when_not_sent(self) -> None:
+        module = load_live_webgen_progress_module()
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            status="done",
+            phase="done",
+            final_delivered=False,
+        )
+
+        updated = module.record_delivery_outcome(
+            state,
+            batch=[{"kind": "assistant", "summary": "✅ 已完成最终交付"}],
+            delivered=False,
+        )
+
+        self.assertFalse(updated.final_delivered)
+        self.assertEqual(updated.final_summary, "✅ 已完成最终交付")
+
+    def test_should_exit_worker_respects_idle_threshold_and_final_delivery(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "should_exit_worker"),
+            "should_exit_worker must be implemented",
+        )
+
+        idle_state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            status="running",
+            idle_poll_count=4,
+        )
+        pending_final_state = WatchState(
+            watch_id="watch-webgen-final",
+            target_session_key="agent:webgen:proj-demo",
+            status="done",
+            phase="done",
+            idle_poll_count=10,
+            final_delivered=False,
+            final_summary="✅ 已完成最终交付",
+        )
+
+        self.assertTrue(module.should_exit_worker(idle_state, idle_exit_polls=4))
+        self.assertFalse(module.should_exit_worker(pending_final_state, idle_exit_polls=4))
+
     def test_resolve_gateway_sessions_send_support_respects_default_http_deny(self) -> None:
         module = load_live_webgen_progress_module()
         self.assertTrue(
@@ -161,6 +337,34 @@ class LiveWebgenProgressTests(unittest.TestCase):
         self.assertFalse(delivered)
         self.assertEqual(calls, [])
         self.assertIn("正在截图验证", output.getvalue())
+
+    def test_handle_rebroadcast_failure_downgrades_when_sessions_send_is_unavailable(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "handle_delivery_failure"),
+            "handle_delivery_failure must be implemented",
+        )
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:main",
+            delivery_strategy="rebroadcast",
+            phase="implementing",
+            status="running",
+        )
+
+        updated = module.handle_delivery_failure(
+            state,
+            RuntimeError('{"message":"Tool not available: sessions_send"}'),
+        )
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.delivery_strategy, "manual_pull")
+        self.assertEqual(updated.origin_session_key, "agent:main:main")
+        self.assertIn("sessions_send", updated.pending_control_summary)
+        self.assertIn("manual_pull", updated.pending_control_summary)
 
     def test_context_usage_ratio_none_is_true_noop_even_with_ack_like_items(self) -> None:
         module = load_live_webgen_progress_module()
