@@ -277,6 +277,8 @@ class LiveWatchTests(unittest.TestCase):
             interval=10.0,
             limit=50,
             max_items=5,
+            debounce_ms=750,
+            fallback_history_interval_seconds=18.0,
             auto_switch_webgen=True,
             once=True,
             jsonl=True,
@@ -291,6 +293,10 @@ class LiveWatchTests(unittest.TestCase):
         self.assertIn("10.0", invocation["command"])
         self.assertIn("50", invocation["command"])
         self.assertIn("5", invocation["command"])
+        self.assertIn("--debounce-ms", invocation["command"])
+        self.assertIn("750", invocation["command"])
+        self.assertIn("--fallback-history-interval-seconds", invocation["command"])
+        self.assertIn("18.0", invocation["command"])
 
     def test_build_rechain_invocation_returns_none_when_not_needed(self) -> None:
         state = WatchState(

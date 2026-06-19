@@ -276,6 +276,8 @@ def build_watch_invocation(
     interval: float = 5.0,
     limit: int = 30,
     max_items: int = 3,
+    debounce_ms: int = 0,
+    fallback_history_interval_seconds: float | None = None,
     auto_switch_webgen: bool = False,
     once: bool = False,
     jsonl: bool = False,
@@ -298,6 +300,13 @@ def build_watch_invocation(
         "--delivery-strategy",
         str(bootstrap["delivery_strategy"]),
     ]
+    if debounce_ms > 0:
+        command.extend(["--debounce-ms", str(int(debounce_ms))])
+    if fallback_history_interval_seconds is not None:
+        command.extend([
+            "--fallback-history-interval-seconds",
+            str(float(fallback_history_interval_seconds)),
+        ])
     if auto_switch_webgen:
         command.append("--auto-switch-webgen")
     if once:
@@ -327,6 +336,8 @@ def build_rechain_invocation(
     interval: float = 5.0,
     limit: int = 30,
     max_items: int = 3,
+    debounce_ms: int = 0,
+    fallback_history_interval_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     if not state.needs_rechain:
         return None
@@ -344,6 +355,8 @@ def build_rechain_invocation(
         interval=interval,
         limit=limit,
         max_items=max_items,
+        debounce_ms=debounce_ms,
+        fallback_history_interval_seconds=fallback_history_interval_seconds,
         supports_hidden_wake=state.delivery_strategy == "hidden_wake",
     )
     invocation["reason"] = state.rechain_reason
@@ -360,6 +373,8 @@ def load_rechain_invocation(
     interval: float = 5.0,
     limit: int = 30,
     max_items: int = 3,
+    debounce_ms: int = 0,
+    fallback_history_interval_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     state = load_watch_state(state_file, watch_id, target_session_key=target_session_key)
     return build_rechain_invocation(
@@ -370,6 +385,8 @@ def load_rechain_invocation(
         interval=interval,
         limit=limit,
         max_items=max_items,
+        debounce_ms=debounce_ms,
+        fallback_history_interval_seconds=fallback_history_interval_seconds,
     )
 
 
