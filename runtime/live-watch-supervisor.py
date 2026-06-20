@@ -19,7 +19,6 @@ from runtime.live_watch import (
     is_terminal_watch,
     load_watch_state,
     save_watch_state,
-    watch_is_delivery_degraded,
 )
 
 
@@ -107,6 +106,14 @@ def build_stateful_deliver_batch_fn(
     return _deliver
 
 
+def summarize_delivery_error(error: Exception) -> str:
+    module = _load_live_webgen_progress_module()
+    if hasattr(module, "summarize_delivery_error"):
+        return str(module.summarize_delivery_error(error))
+    text = str(error).strip()
+    return text or "delivery_failed"
+
+
 def _max_batch_seq(batch: Batch, fallback: int) -> int:
     max_seq = fallback
     for item in batch:
@@ -139,6 +146,7 @@ def deliver_or_queue_batch(
     batch: Batch,
     *,
     deliver_batch_fn: DeliverBatchFn,
+    now: float,
 ) -> tuple[WatchState, bool]:
     if not batch:
         return replace(
@@ -147,7 +155,7 @@ def deliver_or_queue_batch(
             pending_count=len(state.pending_broadcast_items or []),
         ), False
 
-    if watch_is_delivery_degraded(state):
+    if state.delivery_strategy == "manual_pull":
         queued = _merge_pending_items(list(state.pending_broadcast_items or []), batch)
         return replace(
             state,
@@ -155,6 +163,7 @@ def deliver_or_queue_batch(
             pending_broadcast_items=queued,
             pending_count=len(queued),
             last_pending_summary=str(queued[-1].get("summary", "")) if queued else "",
+            delivery_backlog_since=state.delivery_backlog_since or float(now),
             delivery_degraded_reason=state.delivery_degraded_reason or "manual_pull_requires_user_turn",
         ), False
 
@@ -165,6 +174,11 @@ def deliver_or_queue_batch(
             pending_count=0,
             last_pending_summary="",
             last_delivered_seq=_max_batch_seq(batch, state.last_delivered_seq),
+            last_delivery_attempt_at=float(now),
+            last_delivery_success_at=float(now),
+            delivery_failure_count=0,
+            delivery_backlog_since=0.0,
+            last_delivery_error="",
             delivery_degraded_reason="",
         ), True
 
@@ -175,6 +189,10 @@ def deliver_or_queue_batch(
         pending_broadcast_items=queued,
         pending_count=len(queued),
         last_pending_summary=str(queued[-1].get("summary", "")) if queued else "",
+        last_delivery_attempt_at=float(now),
+        delivery_failure_count=int(state.delivery_failure_count) + 1,
+        delivery_backlog_since=state.delivery_backlog_since or float(now),
+        last_delivery_error="delivery_failed",
         delivery_degraded_reason="delivery_failed",
     ), False
 
@@ -199,11 +217,36 @@ def process_watch_once(
         updated_state,
         last_seen_seq=max(updated_state.last_seen_seq, int(new_last_seen)),
     )
-    updated_state, delivered = deliver_or_queue_batch(
+    pending_batch = list(updated_state.pending_broadcast_items or [])
+    delivery_batch = _merge_pending_items(pending_batch, batch)
+    updated_state = replace(
         updated_state,
-        batch,
-        deliver_batch_fn=deliver_batch_fn,
+        pending_broadcast_items=[],
+        pending_count=0,
+        last_pending_summary="",
     )
+    try:
+        updated_state, delivered = deliver_or_queue_batch(
+            updated_state,
+            delivery_batch,
+            deliver_batch_fn=deliver_batch_fn,
+            now=now,
+        )
+    except Exception as error:
+        queued = _merge_pending_items(list(updated_state.pending_broadcast_items or []), delivery_batch)
+        updated_state = replace(
+            updated_state,
+            status="degraded",
+            pending_broadcast_items=queued,
+            pending_count=len(queued),
+            last_pending_summary=str(queued[-1].get("summary", "")) if queued else "",
+            last_delivery_attempt_at=float(now),
+            delivery_failure_count=int(updated_state.delivery_failure_count) + 1,
+            delivery_backlog_since=updated_state.delivery_backlog_since or float(now),
+            last_delivery_error=summarize_delivery_error(error),
+            delivery_degraded_reason="delivery_failed",
+        )
+        delivered = False
     return updated_state, batch, delivered
 
 

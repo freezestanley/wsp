@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from runtime.live_wake_token import is_visible_wake_text, looks_like_wake_token
+from runtime.session_origin import openclaw_root
 
 
 @dataclass(eq=True)
@@ -43,6 +44,11 @@ class WatchState:
     last_session_event_at: float = 0.0
     last_history_pull_at: float = 0.0
     last_delivered_seq: int = -1
+    last_delivery_attempt_at: float = 0.0
+    last_delivery_success_at: float = 0.0
+    delivery_failure_count: int = 0
+    delivery_backlog_since: float = 0.0
+    last_delivery_error: str = ""
     pending_broadcast_items: list[dict[str, Any]] | None = None
     pending_count: int = 0
     last_pending_summary: str = ""
@@ -57,7 +63,6 @@ def is_terminal_watch(state: WatchState) -> bool:
         "done",
         "blocked",
         "canceled",
-        "waiting_user",
     }
 
 
@@ -73,8 +78,20 @@ def watch_requires_supervisor(state: WatchState) -> bool:
     return bool(state.target_session_key.strip()) and not is_terminal_watch(state)
 
 
+def watch_has_delivery_lag(state: WatchState) -> bool:
+    return state.last_seen_seq >= 0 and state.last_delivered_seq < state.last_seen_seq
+
+
 def watch_is_delivery_degraded(state: WatchState) -> bool:
-    return state.delivery_strategy == "manual_pull"
+    if state.delivery_strategy == "manual_pull":
+        return True
+    if state.delivery_strategy != "rebroadcast":
+        return False
+    if state.pending_count > 0 or bool(state.pending_broadcast_items):
+        return True
+    if state.last_delivery_error.strip():
+        return True
+    return watch_has_delivery_lag(state)
 
 
 def _replace_state(state: WatchState, **changes: Any) -> WatchState:
@@ -121,6 +138,11 @@ def _watch_state_from_raw(
         last_session_event_at=float(raw.get("last_session_event_at", 0.0)),
         last_history_pull_at=float(raw.get("last_history_pull_at", 0.0)),
         last_delivered_seq=int(raw.get("last_delivered_seq", -1)),
+        last_delivery_attempt_at=float(raw.get("last_delivery_attempt_at", 0.0)),
+        last_delivery_success_at=float(raw.get("last_delivery_success_at", 0.0)),
+        delivery_failure_count=int(raw.get("delivery_failure_count", 0)),
+        delivery_backlog_since=float(raw.get("delivery_backlog_since", 0.0)),
+        last_delivery_error=str(raw.get("last_delivery_error", "")),
         pending_broadcast_items=pending_items,
         pending_count=int(raw.get("pending_count", len(pending_items))),
         last_pending_summary=str(raw.get("last_pending_summary", "")),
@@ -268,6 +290,30 @@ def normalize_watch_id_component(value: str) -> str:
     return normalized or "default"
 
 
+def _load_live_watch_config(config_path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def resolve_watch_state_root() -> Path:
+    root = openclaw_root()
+    configured_config_path = os.environ.get("OPENCLAW_CONFIG_PATH", "").strip()
+    config_path = Path(configured_config_path).expanduser() if configured_config_path else (root / "openclaw.json")
+    config = _load_live_watch_config(config_path)
+    runtime_cfg = config.get("runtime", {})
+    if isinstance(runtime_cfg, dict):
+        live_watch_cfg = runtime_cfg.get("liveWatch", {})
+        if isinstance(live_watch_cfg, dict):
+            configured_root = str(live_watch_cfg.get("stateRoot") or "").strip()
+            if configured_root:
+                candidate = Path(configured_root).expanduser()
+                return candidate if candidate.is_absolute() else (root / candidate)
+    return root / "tmp" / "openclaw-live-watch"
+
+
 def build_watch_bootstrap(
     *,
     target_session_key: str,
@@ -281,7 +327,7 @@ def build_watch_bootstrap(
     resolved_watch_id = watch_id.strip() if isinstance(watch_id, str) and watch_id.strip() else (
         f"watch-{normalize_watch_id_component(target_session_key)}"
     )
-    resolved_state_root = state_root or (Path(tempfile.gettempdir()) / "openclaw-live-watch")
+    resolved_state_root = state_root or resolve_watch_state_root()
     state = prepare_watch_state(
         WatchState(
             watch_id=resolved_watch_id,
@@ -614,12 +660,37 @@ def summarize_new_messages(
 
 
 def infer_phase_from_summary(summary: str, fallback: str) -> str:
+    lowered = summary.lower()
     if "需要澄清" in summary:
         return "waiting_user"
     if "遇到阻塞" in summary:
         return "blocked"
-    if "截图验证" in summary or "验证" in summary:
+    if (
+        "截图验证" in summary
+        or "验证" in summary
+        or "构建成功" in summary
+        or "测试通过" in summary
+        or "预览服务已启动" in summary
+        or "pnpm build" in lowered
+        or "pnpm preview" in lowered
+        or "pnpm test" in lowered
+    ):
         return "verifying"
+    if (
+        "写入文件" in summary
+        or "编辑文件" in summary
+        or "应用补丁" in summary
+        or "开发开始" in summary
+        or "实现阶段" in summary
+        or "依赖安装" in summary
+        or "安装依赖" in summary
+        or "workflow enter implementation ok" in lowered
+        or "workflow write ok" in lowered
+        or "pnpm install" in lowered
+    ):
+        return "implementing"
+    if "discovery" in lowered or "信息收集" in summary or "澄清" in summary:
+        return "discovery"
     if "阶段结果" in summary or "交付" in summary:
         return "done"
     return fallback

@@ -1,0 +1,4 @@
+dist/*
+!dist/.gitkeep
+payload/*.zip
+payload/payload-manifest.json

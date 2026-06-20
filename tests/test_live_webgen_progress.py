@@ -591,6 +591,19 @@ class LiveWebgenProgressTests(unittest.TestCase):
         self.assertIn("sessions_send", updated.pending_control_summary)
         self.assertIn("manual_pull", updated.pending_control_summary)
 
+    def test_summarize_delivery_error_truncates_generic_rebroadcast_failure(self) -> None:
+        module = load_live_webgen_progress_module()
+        self.assertTrue(
+            hasattr(module, "summarize_delivery_error"),
+            "summarize_delivery_error must be implemented",
+        )
+
+        summary = module.summarize_delivery_error(
+            RuntimeError("sessions_send timeout while pushing progress summary to origin session"),
+        )
+
+        self.assertEqual(summary, "sessions_send timeout while pushing progress summary to origin session")
+
     def test_context_usage_ratio_none_is_true_noop_even_with_ack_like_items(self) -> None:
         module = load_live_webgen_progress_module()
         self.assertTrue(

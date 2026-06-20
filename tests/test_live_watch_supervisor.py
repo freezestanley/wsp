@@ -34,6 +34,7 @@ class LiveWatchSupervisorTests(unittest.TestCase):
             state,
             [{"seq": 41, "summary": "✅ 构建成功"}],
             deliver_batch_fn=lambda batch: delivered_batches.append(batch) or True,
+            now=100.0,
         )
 
         self.assertFalse(delivered)
@@ -59,6 +60,7 @@ class LiveWatchSupervisorTests(unittest.TestCase):
             state,
             [{"seq": 41, "summary": "✅ 构建成功"}],
             deliver_batch_fn=lambda batch: delivered_batches.append(batch) or True,
+            now=100.0,
         )
 
         self.assertTrue(delivered)
@@ -83,6 +85,7 @@ class LiveWatchSupervisorTests(unittest.TestCase):
             state,
             [{"seq": 41, "summary": "✅ 构建成功"}],
             deliver_batch_fn=lambda _batch: True,
+            now=100.0,
         )
 
         self.assertFalse(delivered)
@@ -161,6 +164,146 @@ class LiveWatchSupervisorTests(unittest.TestCase):
         self.assertEqual(updated.last_seen_seq, 9)
         self.assertEqual(updated.last_delivered_seq, 9)
 
+    def test_process_watch_once_replays_existing_backlog_before_new_items(self) -> None:
+        module = load_live_watch_supervisor_module()
+
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:main",
+            delivery_strategy="rebroadcast",
+            pending_broadcast_items=[{"seq": 41, "summary": "🔧 正在构建"}],
+            pending_count=1,
+            last_pending_summary="🔧 正在构建",
+            last_delivered_seq=40,
+            last_seen_seq=41,
+        )
+
+        delivered_batches: list[list[dict[str, object]]] = []
+
+        def fake_run_watch_cycle(**kwargs):
+            updated_state = kwargs["watch_state"]
+            return updated_state, 42, [{"seq": 42, "summary": "✅ 构建成功"}], True
+
+        updated, batch, delivered = module.process_watch_once(
+            state,
+            now=100.0,
+            run_watch_cycle_fn=fake_run_watch_cycle,
+            deliver_batch_fn=lambda items: delivered_batches.append(items) or True,
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(batch, [{"seq": 42, "summary": "✅ 构建成功"}])
+        self.assertEqual(
+            delivered_batches,
+            [[
+                {"seq": 41, "summary": "🔧 正在构建"},
+                {"seq": 42, "summary": "✅ 构建成功"},
+            ]],
+        )
+        self.assertEqual(updated.pending_broadcast_items, [])
+        self.assertEqual(updated.pending_count, 0)
+        self.assertEqual(updated.last_delivered_seq, 42)
+
+    def test_process_watch_once_retries_existing_backlog_without_new_history(self) -> None:
+        module = load_live_watch_supervisor_module()
+
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:main",
+            delivery_strategy="rebroadcast",
+            pending_broadcast_items=[{"seq": 41, "summary": "🔧 正在构建"}],
+            pending_count=1,
+            last_pending_summary="🔧 正在构建",
+            last_delivered_seq=40,
+            last_seen_seq=41,
+        )
+
+        delivered_batches: list[list[dict[str, object]]] = []
+
+        def fake_run_watch_cycle(**kwargs):
+            updated_state = kwargs["watch_state"]
+            return updated_state, 41, [], False
+
+        updated, batch, delivered = module.process_watch_once(
+            state,
+            now=100.0,
+            run_watch_cycle_fn=fake_run_watch_cycle,
+            deliver_batch_fn=lambda items: delivered_batches.append(items) or True,
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(batch, [])
+        self.assertEqual(
+            delivered_batches,
+            [[{"seq": 41, "summary": "🔧 正在构建"}]],
+        )
+        self.assertEqual(updated.pending_broadcast_items, [])
+        self.assertEqual(updated.pending_count, 0)
+        self.assertEqual(updated.last_delivered_seq, 41)
+
+    def test_process_watch_once_records_delivery_failure_metadata(self) -> None:
+        module = load_live_watch_supervisor_module()
+
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:main",
+            delivery_strategy="rebroadcast",
+            last_seen_seq=41,
+        )
+
+        def fake_run_watch_cycle(**kwargs):
+            updated_state = kwargs["watch_state"]
+            return updated_state, 42, [{"seq": 42, "summary": "🔧 继续验证"}], True
+
+        updated, batch, delivered = module.process_watch_once(
+            state,
+            now=100.0,
+            run_watch_cycle_fn=fake_run_watch_cycle,
+            deliver_batch_fn=lambda _batch: False,
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(batch, [{"seq": 42, "summary": "🔧 继续验证"}])
+        self.assertEqual(updated.delivery_failure_count, 1)
+        self.assertEqual(updated.last_delivery_attempt_at, 100.0)
+        self.assertEqual(updated.last_delivery_success_at, 0.0)
+        self.assertEqual(updated.delivery_backlog_since, 100.0)
+        self.assertEqual(updated.last_delivery_error, "delivery_failed")
+        self.assertEqual(updated.pending_count, 1)
+
+    def test_process_watch_once_records_delivery_error_text_from_exception(self) -> None:
+        module = load_live_watch_supervisor_module()
+
+        state = WatchState(
+            watch_id="watch-demo",
+            target_session_key="agent:webgen:proj-demo",
+            origin_session_key="agent:main:main",
+            delivery_strategy="rebroadcast",
+            last_seen_seq=41,
+        )
+
+        def fake_run_watch_cycle(**kwargs):
+            updated_state = kwargs["watch_state"]
+            return updated_state, 42, [{"seq": 42, "summary": "🔧 继续验证"}], True
+
+        def failing_delivery(_batch):
+            raise RuntimeError("sessions_send timeout while pushing progress summary")
+
+        updated, _batch, delivered = module.process_watch_once(
+            state,
+            now=100.0,
+            run_watch_cycle_fn=fake_run_watch_cycle,
+            deliver_batch_fn=failing_delivery,
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(updated.delivery_failure_count, 1)
+        self.assertEqual(updated.last_delivery_error, "sessions_send timeout while pushing progress summary")
+        self.assertEqual(updated.pending_count, 1)
+
     def test_collect_supervisable_watches_only_returns_nonterminal_states(self) -> None:
         module = load_live_watch_supervisor_module()
 
@@ -169,6 +312,7 @@ class LiveWatchSupervisorTests(unittest.TestCase):
             active_file = state_root / "active.json"
             done_file = state_root / "done.json"
             degraded_file = state_root / "degraded.json"
+            waiting_file = state_root / "waiting.json"
             save_watch_state(
                 active_file,
                 WatchState(
@@ -196,6 +340,15 @@ class LiveWatchSupervisorTests(unittest.TestCase):
                     phase="implementing",
                 ),
             )
+            save_watch_state(
+                waiting_file,
+                WatchState(
+                    watch_id="watch-waiting",
+                    target_session_key="agent:webgen:proj-waiting",
+                    status="running",
+                    phase="waiting_user",
+                ),
+            )
 
             collected = module.collect_supervisable_watches(state_root)
 
@@ -204,6 +357,7 @@ class LiveWatchSupervisorTests(unittest.TestCase):
             [
                 ("active.json", "watch-active"),
                 ("degraded.json", "watch-degraded"),
+                ("waiting.json", "watch-waiting"),
             ],
         )
 

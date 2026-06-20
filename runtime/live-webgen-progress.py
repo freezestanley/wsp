@@ -24,6 +24,7 @@ from runtime.live_watch import (
     record_control_event,
     record_cycle_state,
     save_watch_state,
+    single_line,
     summarize_new_messages,
 )
 from runtime.context_nudge import clear_context_ack, maybe_plan_hidden_context_nudge
@@ -464,6 +465,13 @@ def deliver_batch(
 
 def is_sessions_send_unavailable_error(error: Exception) -> bool:
     return "tool not available: sessions_send" in str(error).lower()
+
+
+def summarize_delivery_error(error: Exception) -> str:
+    text = str(error).strip()
+    if not text:
+        return "delivery_failed"
+    return single_line(text, 160)
 
 
 def handle_delivery_failure(state: WatchState, error: Exception) -> WatchState | None:

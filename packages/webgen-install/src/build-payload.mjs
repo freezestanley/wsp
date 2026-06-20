@@ -12,7 +12,6 @@ export function defaultAgentSourceRoot(packageRoot) {
 export function createPayloadManifest({ entries }) {
   return {
     schema: "openclaw.webgen.payload-manifest.v1",
-    generatedAt: new Date().toISOString(),
     files: [...entries],
   };
 }

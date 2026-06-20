@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-test("build payload creates a serializable manifest from the source tree", async () => {
+test("build payload creates a stable serializable manifest from the source tree", async () => {
   const mod = await import("../src/build-payload.mjs");
   const manifest = mod.createPayloadManifest({
     entries: [
@@ -11,6 +11,7 @@ test("build payload creates a serializable manifest from the source tree", async
     ],
   });
 
+  assert.deepEqual(Object.keys(manifest), ["schema", "files"]);
   assert.equal(Array.isArray(manifest.files), true);
   assert.equal(manifest.files.length, 3);
   assert.equal(manifest.files[0], "agent/models.json");

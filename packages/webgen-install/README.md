@@ -31,7 +31,8 @@ bash ./scripts/build-release.sh
 - `install` extracts the payload and registers the agent
 - `verify` checks files, host config, and main-workspace overlay installation
 - `--main-workspace <path>` lets you override the target main agent workspace when it is not `~/.openclaw/workspace`
-- `bash ./scripts/build-release.sh` runs tests, rebuilds payload, refreshes the Desktop package, and writes both `dist/openclaw-webgen-install-<version>.zip` and `dist/openclaw-webgen-install-<version>.tgz`
+- `bash ./scripts/build-release.sh` is the canonical release entry: it runs tests, rebuilds payload, refreshes the Desktop package, and writes both `dist/openclaw-webgen-install-<version>.zip` and `dist/openclaw-webgen-install-<version>.tgz`
+- `dist/*`, `payload/webgen-agent-payload.zip`, and `payload/payload-manifest.json` are generated release artifacts, not source files to maintain by hand
 - Installed `workspace/runtime/live_watch.py` now includes portable watcher helpers for WebGen live broadcast bootstrap:
   - `build_watch_bootstrap(...)`
   - `build_watch_invocation(...)`

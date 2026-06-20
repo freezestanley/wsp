@@ -1,7 +1,11 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import runtime.live_watch as live_watch_module
 from runtime.live_watch import (
     build_watch_bootstrap,
     build_watch_invocation,
@@ -32,6 +36,19 @@ from runtime.live_wake_token import decode_wake_token, encode_wake_token, format
 
 
 class LiveWatchTests(unittest.TestCase):
+    def test_watch_state_includes_delivery_health_fields_for_rebroadcast(self) -> None:
+        field_names = set(WatchState.__dataclass_fields__)
+
+        self.assertTrue(
+            {
+                "last_delivery_attempt_at",
+                "last_delivery_success_at",
+                "delivery_failure_count",
+                "delivery_backlog_since",
+                "last_delivery_error",
+            }.issubset(field_names)
+        )
+
     def test_load_missing_state_returns_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = load_watch_state(
@@ -79,6 +96,11 @@ class LiveWatchTests(unittest.TestCase):
                 last_session_event_at=790.0,
                 last_history_pull_at=791.0,
                 last_delivered_seq=38,
+                last_delivery_attempt_at=794.0,
+                last_delivery_success_at=795.0,
+                delivery_failure_count=2,
+                delivery_backlog_since=796.0,
+                last_delivery_error="sessions_send timeout",
                 pending_broadcast_items=[{"seq": 40, "summary": "🔧 正在验证"}],
                 pending_count=1,
                 last_pending_summary="🔧 正在验证",
@@ -120,6 +142,11 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(loaded.last_worker_heartbeat_at, 0.0)
         self.assertFalse(loaded.final_delivered)
         self.assertEqual(loaded.final_summary, "")
+        self.assertEqual(loaded.last_delivery_attempt_at, 0.0)
+        self.assertEqual(loaded.last_delivery_success_at, 0.0)
+        self.assertEqual(loaded.delivery_failure_count, 0)
+        self.assertEqual(loaded.delivery_backlog_since, 0.0)
+        self.assertEqual(loaded.last_delivery_error, "")
 
     def test_watch_requires_supervisor_and_manual_pull_is_degraded(self) -> None:
         manual_pull = WatchState(
@@ -145,6 +172,41 @@ class LiveWatchTests(unittest.TestCase):
         self.assertFalse(watch_requires_supervisor(done))
         self.assertTrue(watch_is_delivery_degraded(manual_pull))
         self.assertFalse(watch_is_delivery_degraded(rebroadcast))
+
+    def test_watch_is_delivery_degraded_when_backlog_exists_for_rebroadcast(self) -> None:
+        state = WatchState(
+            watch_id="watch-rebroadcast-backlog",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="rebroadcast",
+            pending_broadcast_items=[{"seq": 41, "summary": "🔧 正在验证"}],
+            pending_count=1,
+        )
+
+        self.assertTrue(watch_is_delivery_degraded(state))
+
+    def test_watch_is_delivery_degraded_when_recent_delivery_error_exists(self) -> None:
+        self.assertIn("last_delivery_error", WatchState.__dataclass_fields__)
+        state = WatchState(
+            watch_id="watch-rebroadcast-error",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="rebroadcast",
+            last_delivery_error="sessions_send timeout",
+        )
+
+        self.assertTrue(watch_is_delivery_degraded(state))
+
+    def test_watch_has_delivery_lag_when_last_seen_is_ahead_of_last_delivered(self) -> None:
+        self.assertTrue(hasattr(live_watch_module, "watch_has_delivery_lag"))
+        state = WatchState(
+            watch_id="watch-rebroadcast-lag",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="rebroadcast",
+            last_seen_seq=45,
+            last_delivered_seq=42,
+        )
+
+        self.assertTrue(live_watch_module.watch_has_delivery_lag(state))
+        self.assertTrue(watch_is_delivery_degraded(state))
 
     def test_take_pending_broadcast_batch_returns_items_and_clears_backlog(self) -> None:
         state = WatchState(
@@ -222,6 +284,19 @@ class LiveWatchTests(unittest.TestCase):
 
         self.assertTrue(is_terminal_watch(state))
         self.assertTrue(needs_final_delivery(state))
+
+    def test_waiting_user_phase_remains_resumable(self) -> None:
+        state = WatchState(
+            watch_id="watch-waiting",
+            target_session_key="agent:webgen:proj-demo",
+            status="running",
+            phase="waiting_user",
+            final_delivered=True,
+            final_summary="❓ 需要澄清：请确认页面范围",
+        )
+
+        self.assertFalse(is_terminal_watch(state))
+        self.assertFalse(needs_final_delivery(state))
 
     def test_delivery_strategy_prefers_hidden_wake_when_supported(self) -> None:
         self.assertEqual(
@@ -307,6 +382,55 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(bootstrap["delivery_strategy"], "rebroadcast")
         self.assertEqual(bootstrap["origin_session_key"], "agent:main:discord:dm:buddy")
         self.assertTrue(str(bootstrap["state_file"]).endswith("/watch-agent-webgen-proj-demo.json"))
+
+    def test_build_watch_bootstrap_defaults_state_root_to_openclaw_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".openclaw"
+            root.mkdir(parents=True)
+            with patch.dict(os.environ, {"OPENCLAW_HOME": str(root)}, clear=False):
+                bootstrap = build_watch_bootstrap(
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    requested_strategy="auto",
+                    supports_hidden_wake=False,
+                    supports_sessions_send=True,
+                )
+
+        self.assertEqual(
+            bootstrap["state_file"],
+            root / "tmp" / "openclaw-live-watch" / "watch-agent-webgen-proj-demo.json",
+        )
+
+    def test_build_watch_bootstrap_prefers_configured_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".openclaw"
+            root.mkdir(parents=True)
+            configured_root = Path(tmpdir) / "custom-watch-root"
+            (root / "openclaw.json").write_text(
+                json.dumps(
+                    {
+                        "runtime": {
+                            "liveWatch": {
+                                "stateRoot": str(configured_root),
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"OPENCLAW_HOME": str(root)}, clear=False):
+                bootstrap = build_watch_bootstrap(
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    requested_strategy="auto",
+                    supports_hidden_wake=False,
+                    supports_sessions_send=True,
+                )
+
+        self.assertEqual(
+            bootstrap["state_file"],
+            configured_root / "watch-agent-webgen-proj-demo.json",
+        )
 
     def test_build_watch_bootstrap_respects_explicit_watch_id_and_state_root(self) -> None:
         bootstrap = build_watch_bootstrap(
@@ -843,6 +967,29 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(updated.last_control_event_id, "evt-1")
         self.assertEqual(updated.pending_control_summary, "已把你的确认同步给 webgen，继续实现中。")
         self.assertEqual(updated.phase, "implementing")
+
+    def test_record_cycle_state_leaves_waiting_user_when_implementation_progress_arrives(self) -> None:
+        state = WatchState(
+            watch_id="watch-progress",
+            target_session_key="agent:webgen:proj-demo",
+            status="running",
+            phase="waiting_user",
+            last_progress_summary="❓ 需要澄清：请确认页面范围",
+        )
+
+        updated = record_cycle_state(
+            state,
+            [
+                {
+                    "seq": 27,
+                    "summary": "📝 写入文件：/tmp/demo/src/generated/page.js",
+                }
+            ],
+            now=100.0,
+        )
+
+        self.assertEqual(updated.phase, "implementing")
+        self.assertEqual(updated.status, "running")
 
     def test_maybe_take_control_event_returns_once(self) -> None:
         state = WatchState(

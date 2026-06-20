@@ -76,6 +76,34 @@ test("payload manifest includes stable webgen assets and excludes runtime garbag
     true,
   );
   assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/ensure-live-watch.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/prepare-webgen-live-watch.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/live-watch-supervisor.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/rechain-watch.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/rechain-watch-once.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/session_file_watch.py"),
+    true,
+  );
+  assert.equal(
+    mod.shouldIncludeMainWorkspacePath("runtime/session_origin.py"),
+    true,
+  );
+  assert.equal(
     mod.shouldIncludeMainWorkspacePath("runtime/__pycache__/live_watch.cpython-313.pyc"),
     false,
   );

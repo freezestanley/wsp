@@ -161,6 +161,10 @@ def resolve_watch_action(
             "statusValue": state.status,
             "lastSeenSeq": state.last_seen_seq,
             "lastBroadcastSeq": state.last_broadcast_seq,
+            "lastDeliveredSeq": state.last_delivered_seq,
+            "deliveryFailureCount": state.delivery_failure_count,
+            "deliveryBacklogSince": state.delivery_backlog_since,
+            "lastDeliveryError": state.last_delivery_error,
             "pendingCount": state.pending_count,
             "lastPendingSummary": state.last_pending_summary,
         }
