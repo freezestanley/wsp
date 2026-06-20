@@ -20,7 +20,7 @@
 本次已经把这个缺口补上,并补充了一条新的约束:
 
 1. **AGENTS.md 已强化**:建站委托时必须先读 `skills/delegated-live-broadcasting/SKILL.md`
-2. **AGENTS.md 已写死续航要求**:首条播报后,同回合必须安排 `cron wake`
+2. **AGENTS.md 已写死续航要求**:首条播报后,同回合必须建立可恢复的 `watch state + worker` 续航链
 3. **AGENTS.md 已明确停止条件**:只有交付 / 明确阻塞 / 取消时才能停播
 4. **恢复 runtime 辅助脚本**:方便本地观察、调试、对照 webgen session 增量输出
 5. **弃用可见 announce wake**:不再把自然语言 cron 提示词直接注入当前对话
@@ -56,7 +56,7 @@
   - 负责“首条播报之后必须建立 wake 链”
 - `skills/delegated-live-broadcasting/SKILL.md`
   - 负责直播流程的标准做法
-  - 强调默认优先使用 `cron wake` 续航,不能只口头承诺轮询
+  - 强调默认优先使用 `prepare / ensure / short worker` 续航,不能只口头承诺轮询
 
 ### 二、执行层
 
@@ -65,12 +65,21 @@
   - 在 `rebroadcast` 模式下负责把新增摘要主动回推到 `originSessionKey`
 - `sessions_history(...)`
   - 负责读取被委托 session 的真实新增动作
-- `cron.add(...)`
-  - 负责在 20–40 秒后继续触发当前对话绑定的 hidden/internal wake
-  - 形成跨回合的直播链
+- `runtime/prepare-webgen-live-watch.py`
+  - 普通用户回合的高层桥接入口
+  - 先做 deterministic resume 预检
+  - 再把最终 `targetSessionKey` 交给 `runtime/ensure-live-watch.py`
+- `runtime/ensure-live-watch.py`
+  - watch 生命周期的唯一决策入口
+  - 返回 `start / resume / active / idle`
+  - 调用方只需执行返回的 `invocation`
 - `runtime/live_watch.py`
   - 负责本地 watch 状态持久化
   - 负责增量摘要、内部调度文本过滤,以及 silent context nudge 相关状态
+  - 当前主路径依赖 `lease` 与 `final_delivered`，而不是依赖下一条 cron 能否创建成功
+- `cron.add(...)`
+  - 不再是主路径前提
+  - 只保留给旧 wake/hidden wake 兼容场景
 - `runtime/live_wake_token.py`
   - 负责生成/解析最小泄露 wake token
 
@@ -141,13 +150,10 @@ workspace 层当前建议的阈值策略:
    - 优先 `hidden_wake`
    - 无 hidden wake 但有 `sessions_send(sessionKey=...)` → `rebroadcast`
    - 两者都没有 → `manual_pull`
-7. 立刻创建一次 `cron wake`
-   - `hidden_wake`：payload 只放结构化字段,例如 `watchId / targetSessionKey / lastSeenSeq / phase`
-   - `rebroadcast`：wake / watcher 可以跑在独立承载 session，但后续摘要必须显式回推到 `originSessionKey`
-   - 禁止把 wake 建成 `sessionTarget:"main"` + `payload.kind:"systemEvent"`，否则会落到 dashboard/background session
-8. 若 wake 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
+7. 普通用户回合优先用 `prepare-webgen-live-watch.py` 或 `ensure-live-watch.py` 启动/接管 watcher
+8. 若 worker 周期能取得 context usage ratio,可内部追加 silent context nudge 决策;若没有该 ratio,则不改变既有直播流程
 
-### wake 回合
+### worker 周期
 
 1. 读取目标 session 的 `sessions_history(..., includeTools=true)`
 2. 若本轮有 context usage ratio,先内部计算 compaction band,并决定是否规划 silent context nudge；若没有,跳过该步骤
@@ -158,17 +164,86 @@ workspace 层当前建议的阈值策略:
    - 已交付 → 停播并汇总
    - 明确阻塞 → 停播并向用户转达
    - 长时间无新增 → 按阈值发一条低噪音进度心跳（默认至少间隔 60 秒）
-   - 未结束 → 再安排下一次 wake
-7. 若本轮遇到 `Cron tool is restricted to the current cron job.`:
+   - 未结束 → 在短窗口内继续轮询，空闲则主动退出
+7. 旧 cron 兼容路径若遇到 `Cron tool is restricted to the current cron job.`:
    - 不要再次 `cron.add`
-   - 优先续用当前 job；若支持则 `cron.update` 当前 job
-   - 若当前回合确实无法续用，就把补链动作推迟到下一次普通用户回合，但不能把这轮失败包装成“监听已恢复”
+   - 把它视为旧路径受限
+   - 下一次普通用户回合切回 `prepare / ensure` 主路径
 
 注意:
 
 - silent context nudge 本身不是“可播报进度”; 即使本轮只发生了内部 nudge,也不应因此输出用户可见消息
 - 当前 workspace 仍未完成真正的 hidden `sessions_send` 投递,也还不能单靠 workspace 消掉 `[cron:...]` / `Current time` / `Reference UTC` 系统包裹
 - `rebroadcast` 的目标不是“让 cron 理解当前会话”,而是“让用户当前对话收到摘要”;因此它是可迁移基础能力,`hidden_wake` 才是增强体验
+- 当前推荐主路径已经改成 `prepare / ensure / short worker`；`cron / rechain` 仅保留兼容职责
+
+### 普通用户回合补链
+
+若上一轮 wake 已把 watch 标成 `needs_rechain`：
+
+1. **优先走统一入口**：
+
+```bash
+python3 runtime/ensure-live-watch.py --session-key agent:webgen:proj-<slug> --json
+```
+
+2. 返回约定：
+   - `status: "start"`：这是首次拉起 watcher，直接执行返回的 `invocation`
+   - `status: "resume"`：当前 watch 处于待补链态，直接执行返回的 `invocation`
+   - `status: "active"`：当前 watch 已活跃，不要重复拉起第二条 watcher
+   - `status: "idle"`：当前 watch 已终态或暂无恢复动作
+3. `start / resume` 的调用方都**不要**自己手工拼 `--state-file / --watch-id / --delivery-strategy`；统一使用返回的 `command + env`
+
+### 普通用户回合统一桥接入口
+
+如果当前调用侧还没先拿到最终 `targetSessionKey`，推荐直接用：
+
+```bash
+python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --slug <new-slug> --json
+```
+
+它会在普通用户回合里统一做两步：
+
+1. 先跑现有 `runtime/webgen_resume_resolver.py` 的确定性复用判断
+2. 再把最终 `targetSessionKey` 交给 `runtime/ensure-live-watch.py`
+
+返回约定：
+
+- `status: "ready"`：已得到最终 `targetSessionKey`，并返回 `watch`
+- `status: "unresolved"`：当前既没有命中确定性旧项目，也没有提供新项目 `slug`
+
+这个桥接入口不会改变现有项目检索语义，只是把“resume 预检 + ensure-watch”合并成一次普通用户回合可直接调用的控制面动作。
+
+低层 helper 仍然保留，适合调用方只想处理“待补链恢复”这一条窄路径：
+
+1. 读取对应 `state_file + watch_id`
+2. 调 `load_rechain_invocation(...)`
+3. 若返回非空：
+   - 直接使用它给出的 `command + env` 重新启动 watcher
+   - 不要重新手工拼 `--state-file / --watch-id / --delivery-strategy`
+4. 若返回空：
+   - 说明当前 watch 不处于待补链态，不要重复补链
+
+如果调用方不想自己 import Python helper，也可以直接用薄入口脚本：
+
+```bash
+python3 runtime/rechain-watch.py --state-file /tmp/openclaw-live-watch/<watch-id>.json --watch-id <watch-id> --ok-if-idle --dry-run --json
+```
+
+去掉 `--dry-run` 后会直接执行恢复命令。
+
+如果连 `--ok-if-idle` 也不想每次手写，可以直接用包装脚本：
+
+```bash
+python3 runtime/rechain-watch-once.py --state-file /tmp/openclaw-live-watch/<watch-id>.json --watch-id <watch-id> --dry-run --json
+```
+
+它会自动补上 `--ok-if-idle`。
+
+返回约定：
+
+- `status: "ready"`：当前确实存在待补链 watcher，并返回 `invocation`
+- `status: "idle"`：当前没有待补链 watcher；若使用了 `--ok-if-idle`，脚本返回码仍为 `0`
 
 ---
 

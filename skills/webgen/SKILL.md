@@ -25,6 +25,7 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
    - 命中后直接使用返回的 `sessionKey` 和 `mode=resume:<slug>` 委托，**不要**先发到 `agentId="webgen"`。
    - 若结果是 `no-deterministic-project-match`，再回到正常澄清 / 新项目路由；若结果是 `ambiguous-deterministic-project-match`，先向用户确认到底是哪个旧项目。
    - 这一步只做确定性复用，不做模糊猜测。
+   - 若调用侧想走统一桥接入口，可直接用 `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --json`；它内部仍然先做这一步 resume 预检，不改变规则。
 4. **用独立 sessionKey 落地**：
    - 澄清/Discovery（只问不写）：可用 `sessions_send(agentId="webgen", ...)`。
    - 老项目且预检命中时：直接用 resolver 返回的 `sessionKey` 委托并监听。
@@ -33,6 +34,11 @@ description: "将建站类内容原样委托给 webgen agent，main 只做转发
    - 不要用 `agentId="webgen"` 落地实现，会撞 webgen 的单项目锁导致 ping-pong 死结。
 5. **委托后立即监听**：
    - 首条播报"已委托 + 当前阶段 + 承载任务的 sessionKey"。
+   - 若此时还未显式拿到最终 `targetSessionKey`，优先走 `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --slug <new-slug> --json`，让它统一完成“项目检索/复用判断 + ensure-watch”。
+   - **统一入口**：无论是首次拉起 watcher，还是 cron 受限后的普通用户回合补链，都优先调用 `python3 runtime/ensure-live-watch.py --session-key <目标sessionKey> --json`。
+   - 若返回 `status: "start"` 或 `status: "resume"`：直接执行返回的 `invocation.command + invocation.env`，不要自己手拼 `--state-file / --watch-id / --delivery-strategy`。
+   - 若返回 `status: "active"`：说明当前 watch 已处于活跃态，普通用户回合不要重复拉起第二条 watcher。
+   - 若返回 `status: "idle"`：说明当前 watch 已终态或暂无可恢复动作，可按当前任务状态决定是否静默。
    - 同一回合内建立续航：优先使用 hidden/internal wake；若目标实例不支持 hidden wake,则必须记录 `originSessionKey` 并切到 `rebroadcast`，由 watcher 后续把新增摘要 `sessions_send` 回原会话。payload 仅含结构化字段（watchId/targetSessionKey/lastSeenSeq/phase），**禁止**把自然语言调度提示词通过 announce 投进对话框。
    - `sessions_send` 经 HTTP gateway 默认可能被禁用；portable 模式下应先检查 `gateway.tools.allow/deny`，不要把 `rebroadcast` 当成无条件可用。
    - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 冒充“回到当前对话继续播报”。

@@ -2,281 +2,261 @@
 
 ## 背景
 
-当前直播主链路已经从 cron 迁到 `watch state + ensure-live-watch + short worker`，但 worker 仍通过固定间隔调用 `sessions_history(...)` 轮询目标 session。
+当前直播链路已经具备两层能力：
 
-这带来两个问题：
+- 通过 `sessions_history(...)` 拉增量消息
+- 通过 session 文件变化决定是否值得去拉 history
 
-- 实时性受轮询间隔限制，短间隔会增加无效请求
-- worker 明明知道底层 session 已经落盘到本地文件，却没有利用文件变化作为更准确的触发信号
+但这套能力被挂在 `runtime/live-webgen-progress.py` 这种短生命周期 worker 上。只要 worker 空闲退出，而当前投递策略又是 `manual_pull`，主对话就不会再自动收到新增播报。
+
+这说明问题不在“是否看得到 session 变化”，而在：
+
+- 监听进程不常驻
+- `manual_pull` 被误当成直播正常
+- 空闲退出后没有真正的后台续航者接管
 
 ## 目标
 
-在**不推翻现有状态驱动架构**的前提下，把 worker 的触发源从“时间轮询”改成“session 文件变化触发”，同时保留当前恢复链路：
+在保留现有 watch state 和 resume 语义的前提下，把直播从“可恢复短 worker”升级成“中央常驻 supervisor + 明确降级态”：
 
-- 保留 `ensure-live-watch.py` 的 `start / resume / active / idle`
-- 保留 `WatchState`、`lease`、`lastSeenSeq / lastBroadcastSeq`
-- 保留最终以 `sessions_history(...)` 作为标准消息读取源
-- 允许 worker 短生命周期退出，并在后续通过 `ensure` 恢复
+- session 文件变化仍然作为 history 拉取触发器
+- 监听职责从短 worker 提升为常驻 supervisor
+- `manual_pull` 不再伪装成 active，而是显式 degraded
+- 没有自动投递能力时，新增进展进入 backlog，等待下次主回合补播
 
 ## 非目标
 
-- 不把直播主路径改成常驻 daemon
-- 不把 `.jsonl` 直接作为业务消息解析源
-- 不改 deterministic resume、`slug -> sessionKey` 绑定和现有委托语义
-- 不移除现有 `interval` 参数；它在新方案里降级为文件探测与 fallback 的节流参数
+- 不直接把 `.jsonl` 当业务语义源解析
+- 不改 deterministic resume、`slug -> sessionKey` 绑定
+- 不依赖 cron 恢复旧路径
+- 不要求 runtime 先支持 hidden wake 才能落地
+
+## 结论
+
+推荐方案是：
+
+- 保留 session 文件监听
+- 保留 `sessions_history(...)` 作为标准消息读取源
+- 新增一个常驻 `live-watch-supervisor`
+- 把 `live-webgen-progress.py` 降级为一次性补偿 worker / 调试入口
+- 把 `manual_pull` 明确标成 `degraded`
+
+这是当前最小但正确的结构升级。只修文件变化检测，不能解决漏播。
 
 ## 核心决策
 
-### 1. `.jsonl` 只做触发器，不做语义源
+### 1. 引入常驻 supervisor
 
-目标 session 的底层文件实际位于：
+新增：
 
-- `~/.openclaw/agents/<agent>/sessions/<session-id>.jsonl`
-
-该文件会随着 session 消息持续追加。新方案只把它当作“有新动作发生”的信号源。一旦检测到变化，worker 仍调用：
-
-- `sessions_history(sessionKey=..., includeTools=true, limit=N)`
-
-来拿标准化消息，再沿用现有摘要逻辑。
-
-这样做的原因：
-
-- `.jsonl` 属于底层存储，格式更容易变化
-- `sessions_history(...)` 已经承载了现有摘要、去重、终态判断语义
-- 这次重构只改监听机制，不同时改动消息解释层
-
-### 2. 保留短生命周期 worker，不引入长期常驻进程
-
-worker 仍然是可重入、可恢复的短进程：
-
-1. 通过 `ensure-live-watch.py` 获得启动或恢复决策
-2. 抢占 lease 并读取 watch state
-3. 定位目标 session 文件
-4. 等待文件变化
-5. 变化后去抖，再拉取 `sessions_history(...)`
-6. 回推新增摘要并更新 watch state
-7. 空闲一段时间后退出
-
-这样可以继续满足：
-
-- 进程被杀后仍可恢复
-- 页面刷新 / main 重启后仍可接管
-- 不需要宿主环境额外维护常驻守护进程
-
-### 3. 引入“文件变化驱动 + 低频 fallback”
-
-第一版不依赖额外第三方库，使用一个轻量的文件状态探测器：
-
-- `mtime`
-- `size`
-- `inode`
-- `exists`
-
-worker 循环改为：
-
-1. 采样当前 session 文件状态
-2. 如果与上次记录不同，则记为一次文件事件
-3. 对文件事件进行短暂去抖
-4. 去抖后调用 `sessions_history(...)`
-5. 若文件不存在或无法稳定定位，则回退到低频 `sessions_history(...)` 轮询
-
-这个方案本质上是“文件事件优先，时间轮询兜底”。
-
-## 组件设计
-
-### `runtime/session_file_watch.py`（新增）
+- `runtime/live-watch-supervisor.py`
 
 职责：
 
-- 根据 `targetSessionKey` 推导目标 agent
-- 读取 `~/.openclaw/agents/<agent>/sessions/sessions.json`
-- 解析 `sessionFile` 或 `sessionId`
-- 返回实际监听的 `.jsonl` 路径
-- 提供文件状态采样与变更判断 helper
+- 周期性扫描 `runtime/state/live-watches/*.json`
+- 只接管 `pending / active / degraded` 的 watch
+- 为每个 watch 持续监听目标 session 文件变化
+- 检测到变化后增量拉 `sessions_history(...)`
+- 根据投递策略决定立即回推还是进入 backlog
 
-建议接口：
+这一步把“监听是否存在”从某个短 worker 是否正好活着，改成独立的、可观察的后台事实。
 
-- `resolve_session_file_path(session_key: str, root: Path | None = None) -> Path | None`
-- `sample_session_file(path: Path | None) -> SessionFileSample`
-- `detect_session_file_change(previous, current) -> bool`
-- `should_relocate_session_file(previous_path, current_path) -> bool`
+### 2. `manual_pull` 改成显式 degraded
 
-建议数据结构：
+当前错误在于：
 
-- `SessionFileSample`
-  - `path`
-  - `exists`
-  - `mtime`
-  - `size`
-  - `inode`
-  - `sampled_at`
+- `deliveryStrategy=manual_pull`
+- `status=idle`
+
+仍然容易被误解成“监听逻辑正常，只是暂时安静”。
+
+新语义改为：
+
+- `hidden_wake / rebroadcast` 且 supervisor 正常：`status=active`
+- 只有 `manual_pull`：`status=degraded`
+- 已完成：`done`
+- 等待用户：`blocked`
+
+`degraded` 的含义必须固定为：
+
+- 可以继续采集新增
+- 不保证自动播报
+- 必须积压 backlog
+
+### 3. session 文件仍只做触发器
+
+保持不变：
+
+- `.jsonl` 文件只用于判断“是否有新动作”
+- 真正消息仍通过 `sessions_history(sessionKey=..., includeTools=true, limit=N, afterSeq=...)` 获取
+
+原因：
+
+- `.jsonl` 存储格式不是稳定契约
+- 现有摘要、去重、终态判断已经都建立在 history 之上
+- 本次要修的是“监听生命周期”和“自动投递语义”
+
+### 4. backlog 成为一等状态
+
+当投递层不可自动回推时，不允许“看到了新增但静默丢掉”。
+
+state 新增：
+
+- `last_delivered_seq`
+- `pending_broadcast_items`
+- `pending_count`
+- `last_pending_summary`
+
+行为：
+
+- supervisor 发现新增，但当前只能 `manual_pull`
+- 将摘要写入 backlog
+- 下一次普通用户回合先补播 backlog，再继续监听恢复
+
+### 5. supervisor 负责 session 文件重解析
+
+文件 rotate / reset / 路径迁移时：
+
+- 先检测旧路径失效
+- 再回读 `sessions.json`
+- 刷新 `session_file_path`
+- 继续监听新文件
+
+这部分逻辑沿用刚完成的“旧路径失效后重解析”能力，但执行主体从短 worker 升级为常驻 supervisor。
+
+## 组件设计
+
+### `runtime/live-watch-supervisor.py`（新增）
+
+建议职责：
+
+- 启动单实例守护
+- claim 全局 supervisor lease
+- 周期扫描 watch state
+- 对每个 watch 执行：
+  - session 文件定位 / 重定位
+  - 文件状态采样
+  - 文件变化去抖
+  - history 增量拉取
+  - batch 摘要生成
+  - 自动回推或 backlog 落盘
+
+建议状态写入：
+
+- `supervisor_pid`
+- `supervisor_started_at`
+- `supervisor_heartbeat_at`
+- `last_poll_at`
 
 ### `runtime/live_watch.py`
 
-扩展 `WatchState`，新增最小必要状态：
+扩展 `WatchState`：
 
-- `session_file_path`
-- `session_file_mtime`
-- `session_file_size`
-- `session_file_inode`
-- `last_session_event_at`
-- `last_history_pull_at`
+- `last_delivered_seq`
+- `pending_broadcast_items`
+- `pending_count`
+- `last_pending_summary`
+- `supervisor_pid`
+- `supervisor_started_at`
+- `supervisor_heartbeat_at`
+- `delivery_degraded_reason`
 
-作用：
+新增 helper：
 
-- worker 重启后不用重新从空状态等待
-- 文件 rotate / reset / 替换时可识别
-- 避免同一轮写入反复触发 history 拉取
-
-### `runtime/live-webgen-progress.py`
-
-这是主改动点。
-
-当前行为：
-
-- 每轮 `sleep(interval)` 后直接拉 `sessions_history(...)`
-
-改为：
-
-1. 启动时解析 `targetSessionKey -> session_file_path`
-2. 若可定位文件，则进入“采样文件变化”循环
-3. 仅在检测到变化时触发 `sessions_history(...)`
-4. 若无法定位文件或定位失败次数过多，则退回低频轮询
-5. 保留终态补发、rebroadcast、context nudge、lease heartbeat
+- `watch_requires_supervisor(...)`
+- `watch_is_delivery_degraded(...)`
+- `take_pending_broadcast_batch(...)`
 
 ### `runtime/ensure-live-watch.py`
 
-主状态机不需要重写，只做两类补充：
+职责从“给 short worker 下指令”改成：
 
-- 启动 invocation 时允许向 worker 传递新的去抖 / fallback 参数
-- `resume` 场景下不重置 session 文件相关状态
+- 检查 watch state 是否存在
+- 检查 supervisor 是否存活
+- 检查当前 watch 是否已经注册
+- 返回：
+  - `start`
+  - `resume`
+  - `active`
+  - `degraded`
+  - `idle`
 
-## Worker 状态机
+如果 supervisor 不存在：
 
-### 启动
+- 返回启动 supervisor 的 invocation
 
-1. 读取 watch state
-2. claim lease
-3. 定位目标 session 文件
-4. 把定位结果写回 watch state
+如果 strategy 是 `manual_pull`：
 
-### 正常循环
+- 返回 `degraded`
+- 不能再伪装成 `active`
 
-1. 采样当前文件状态
-2. 若文件有变化：
-   - 记录 `last_session_event_at`
-   - 等待去抖窗口，例如 `300-800ms`
-   - 再次采样确认稳定
-   - 调用 `sessions_history(...)`
-3. 若无变化：
-   - 不拉 history
-   - 增加空闲计数
-4. 若空闲到阈值：
-   - worker 主动退出
+### `runtime/live-webgen-progress.py`
 
-### 终态
+保留但降级定位：
 
-若 `sessions_history(...)` 判断任务已完成/阻塞：
+- 一次性补偿 worker
+- supervisor 内部复用的单 watch cycle helper
+- 手工调试入口
 
-- 先生成最终摘要
-- 若投递成功，置 `final_delivered=true`
-- 更新 `status / phase`
-- 释放 worker 生命周期，让下一次 `ensure` 返回 `idle`
+不再承担“后台一直活着监听”的主责任。
+
+## 运行模型
+
+### 正常自动直播
+
+1. main 创建或恢复 watch state
+2. `ensure-live-watch.py` 确认 supervisor 存在
+3. supervisor 常驻监听目标 session 文件
+4. 文件变化后拉 `sessions_history(...)`
+5. 若 `rebroadcast / hidden_wake` 可用，立即回推主对话
+6. 更新 `last_seen_seq / last_delivered_seq`
+
+### 降级直播
+
+1. main 创建 watch
+2. `ensure-live-watch.py` 发现只有 `manual_pull`
+3. watch 标成 `degraded`
+4. supervisor 仍继续采集新增
+5. 新增摘要写入 backlog
+6. 下次主会话被唤起时补播 backlog
 
 ## 异常与边界
 
-### 1. `sessions.json` 没有 `sessionFile`
+### 1. supervisor 不存在
 
 处理：
 
-- 尝试退回 `sessionId -> <session-id>.jsonl`
-- 若仍失败，进入低频 history fallback
+- `ensure-live-watch.py` 必须能重启它
+- 不能只返回一个“resume short worker”就算恢复完成
 
-### 2. session 文件暂时不存在
-
-可能原因：
-
-- session 尚未真正落盘
-- 文件被 reset / rotate
-- 元数据与文件状态短暂不同步
-
-处理：
-
-- 不立刻报错
-- 记录一次缺失状态
-- 低频重试定位
-- 同时保留低频 `sessions_history(...)` 兜底
-
-### 3. 文件变了，但 history 没新增
-
-原因可能是：
-
-- 写入的是非消息元数据
-- 写入后被压缩、折叠或重排
+### 2. session 文件存在变化，但 history 没新增
 
 处理：
 
 - 更新文件采样状态
-- 不播报
-- 不推进 `lastBroadcastSeq`
+- 不回推
+- 不推进 `last_delivered_seq`
 
-### 4. 文件被 rotate / reset
-
-判定信号：
-
-- `inode` 变化
-- `size` 明显回退
-- 路径变更
+### 3. rebroadcast 失败
 
 处理：
 
-- 重新定位 session 文件
-- 更新文件状态缓存
-- **不**回退 `lastSeenSeq`
+- 降级为 `degraded`
+- 把当前 batch 写入 backlog
+- 记录 `delivery_degraded_reason`
 
-### 5. worker 在文件等待期间崩溃
+### 4. watch 已 done / blocked
 
-影响可接受，因为：
+处理：
 
-- state 已落盘
-- lease 过期后 `ensure-live-watch.py` 会返回 `resume`
-- 新 worker 可以继续接管
+- supervisor 停止对其轮询
+- 若仍有待补 final summary，则先补一次再归档
 
-## 参数建议
+## 验收标准
 
-新增 worker 参数建议：
+必须同时满足：
 
-- `--debounce-ms`：默认 `500`
-- `--idle-exit-seconds` 或继续沿用 `idle_exit_polls`
-- `--file-probe-interval-ms`：默认 `800-1500`
-- `--fallback-history-interval-seconds`：默认 `15-30`
-- `--session-file`：可选，若已预解析则直接传入
-
-第一版也可以只加：
-
-- `--debounce-ms`
-- `--fallback-history-interval-seconds`
-
-其余使用现有 `interval` 复用。
-
-## 测试策略
-
-需要覆盖：
-
-- `targetSessionKey -> session_file_path` 解析
-- `sessionFile` / `sessionId` 两种元数据路径
-- 文件变化判定：mtime、size、inode、exists
-- 去抖后只触发一次 history 拉取
-- 文件变化但无 history 新消息时不重播
-- 文件 reset / rotate 后不丢 `lastSeenSeq`
-- 无法定位文件时回退到低频 polling
-- 终态补发逻辑不受影响
-
-## 成功标准
-
-- worker 不再每轮都调用 `sessions_history(...)`
-- session 文件未变化时，history 调用次数显著下降
-- session 文件变化后，新增步骤能更快被播报
-- worker 挂掉后，仍能通过 `ensure-live-watch.py` 恢复
-- `final_delivered`、`rebroadcast`、`manual_pull` 语义保持不变
-
+1. webgen session 持续追加记录时，即使主对话无人操作，watch state 也持续前进
+2. `rebroadcast / hidden_wake` 下，新增进展能自动播报
+3. `manual_pull` 下，状态明确是 `degraded`，且 backlog 不丢
+4. session 文件轮转、进程重启后，watch 能自动恢复，不回退 cursor

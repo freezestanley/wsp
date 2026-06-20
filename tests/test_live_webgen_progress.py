@@ -125,6 +125,73 @@ class LiveWebgenProgressTests(unittest.TestCase):
         self.assertEqual(len(batch), 1)
         self.assertIn("截图检查", batch[0]["summary"])
 
+    def test_run_watch_cycle_re_resolves_session_file_when_saved_path_missing(self) -> None:
+        module = load_live_webgen_progress_module()
+
+        state = WatchState(
+            watch_id="watch-webgen-demo",
+            target_session_key="agent:webgen:proj-demo",
+            session_file_path="/tmp/old.jsonl",
+            session_file_mtime=10.0,
+            session_file_size=100,
+            session_file_inode=1,
+            last_session_event_at=95.0,
+            last_history_pull_at=95.0,
+        )
+        samples = {
+            "/tmp/old.jsonl": module.SessionFileSample(
+                path=Path("/tmp/old.jsonl"),
+                exists=False,
+                mtime=0.0,
+                size=0,
+                inode=0,
+                sampled_at=100.0,
+            ),
+            "/tmp/new.jsonl": module.SessionFileSample(
+                path=Path("/tmp/new.jsonl"),
+                exists=True,
+                mtime=11.0,
+                size=110,
+                inode=2,
+                sampled_at=101.0,
+            ),
+        }
+
+        updated, last_seen, batch, pulled = module.run_watch_cycle(
+            watch_state=state,
+            current_session_key="agent:webgen:proj-demo",
+            last_seen=11,
+            now=100.0,
+            limit=30,
+            max_items=3,
+            heartbeat_idle_polls=3,
+            heartbeat_interval_seconds=60.0,
+            fallback_history_interval_seconds=30.0,
+            session_file_resolver=lambda _session_key: Path("/tmp/new.jsonl"),
+            sample_session_file_fn=lambda path: samples[str(path)],
+            invoke_sessions_history_fn=lambda _session_key, _include_tools, _limit: {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "已切到新 session 文件，继续验证"}],
+                        "__openclaw": {"seq": 12},
+                    }
+                ]
+            },
+            debounce_seconds=0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertTrue(pulled)
+        self.assertEqual(updated.session_file_path, "/tmp/new.jsonl")
+        self.assertEqual(updated.session_file_mtime, 11.0)
+        self.assertEqual(updated.session_file_size, 110)
+        self.assertEqual(updated.session_file_inode, 2)
+        self.assertEqual(updated.last_history_pull_at, 100.0)
+        self.assertEqual(last_seen, 12)
+        self.assertEqual(len(batch), 1)
+        self.assertIn("继续验证", batch[0]["summary"])
+
     def test_run_watch_cycle_does_not_rebroadcast_when_history_has_no_new_messages(self) -> None:
         module = load_live_webgen_progress_module()
 

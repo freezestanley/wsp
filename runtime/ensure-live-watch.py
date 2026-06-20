@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.live_watch import (
+    WatchState,
     build_rechain_invocation,
     build_watch_bootstrap,
     build_watch_invocation,
@@ -20,12 +21,15 @@ from runtime.live_watch import (
     load_watch_state,
     needs_final_delivery,
     prepare_watch_state,
+    save_watch_state,
+    watch_is_delivery_degraded,
 )
 from runtime.session_origin import discover_origin_session_key, discover_sessions_send_support
 
 
 OriginSessionKeyResolver = Callable[[], str]
 SupportsSessionsSendResolver = Callable[[], bool]
+SUPERVISOR_HEARTBEAT_TTL_SECONDS = 30.0
 
 
 def has_saved_watch_state(state_file: Path, watch_id: str) -> bool:
@@ -39,6 +43,49 @@ def has_saved_watch_state(state_file: Path, watch_id: str) -> bool:
     if not isinstance(watches, dict):
         return False
     return isinstance(watches.get(watch_id), dict)
+
+
+def has_active_supervisor(
+    state: WatchState,
+    *,
+    now: float,
+    heartbeat_ttl_seconds: float = SUPERVISOR_HEARTBEAT_TTL_SECONDS,
+) -> bool:
+    return (
+        float(state.supervisor_heartbeat_at) > 0.0
+        and (float(now) - float(state.supervisor_heartbeat_at)) <= max(float(heartbeat_ttl_seconds), 1.0)
+    )
+
+
+def build_supervisor_invocation(
+    *,
+    state_file: Path,
+    origin_session_key: str,
+    python_bin: str = "python3",
+    script_path: str = "runtime/live-watch-supervisor.py",
+    debounce_ms: int = 0,
+    fallback_history_interval_seconds: float | None = None,
+) -> dict[str, Any]:
+    command = [
+        python_bin,
+        script_path,
+        "--state-root",
+        str(state_file.parent),
+    ]
+    if debounce_ms > 0:
+        command.extend(["--debounce-ms", str(int(debounce_ms))])
+    if fallback_history_interval_seconds is not None:
+        command.extend([
+            "--fallback-history-interval-seconds",
+            str(float(fallback_history_interval_seconds)),
+        ])
+    env: dict[str, str] = {}
+    if origin_session_key.strip():
+        env["OPENCLAW_ORIGIN_SESSION_KEY"] = origin_session_key.strip()
+    return {
+        "command": command,
+        "env": env,
+    }
 
 
 def resolve_watch_action(
@@ -114,6 +161,8 @@ def resolve_watch_action(
             "statusValue": state.status,
             "lastSeenSeq": state.last_seen_seq,
             "lastBroadcastSeq": state.last_broadcast_seq,
+            "pendingCount": state.pending_count,
+            "lastPendingSummary": state.last_pending_summary,
         }
         if state.needs_rechain:
             invocation = build_rechain_invocation(
@@ -130,11 +179,6 @@ def resolve_watch_action(
                 "status": "resume",
                 "reason": state.rechain_reason,
                 "invocation": invocation,
-            }
-        if has_active_lease(state, now=effective_now):
-            return {
-                **active_payload,
-                "status": "active",
             }
         if needs_final_delivery(state):
             return {
@@ -156,34 +200,61 @@ def resolve_watch_action(
                 **active_payload,
                 "status": "idle",
             }
+        if not has_active_supervisor(state, now=effective_now):
+            return {
+                **active_payload,
+                "status": "resume",
+                "reason": "supervisor_inactive",
+                "invocation": build_supervisor_invocation(
+                    state_file=resolved_state_file,
+                    origin_session_key=str(bootstrap["origin_session_key"]),
+                    debounce_ms=debounce_ms,
+                    fallback_history_interval_seconds=fallback_history_interval_seconds,
+                ),
+            }
+        if watch_is_delivery_degraded(state):
+            return {
+                **active_payload,
+                "status": "degraded",
+            }
+        if has_active_lease(state, now=effective_now):
+            return {
+                **active_payload,
+                "status": "active",
+            }
         return {
             **active_payload,
             "status": "resume",
             "reason": "lease_expired",
-            "invocation": build_watch_invocation(
-                bootstrap,
-                interval=interval,
-                limit=limit,
-                max_items=max_items,
+            "invocation": build_supervisor_invocation(
+                state_file=resolved_state_file,
+                origin_session_key=str(bootstrap["origin_session_key"]),
                 debounce_ms=debounce_ms,
                 fallback_history_interval_seconds=fallback_history_interval_seconds,
-                supports_hidden_wake=str(bootstrap["delivery_strategy"]) == "hidden_wake",
             ),
         }
 
-    invocation = build_watch_invocation(
-        bootstrap,
-        interval=interval,
-        limit=limit,
-        max_items=max_items,
-        debounce_ms=debounce_ms,
-        fallback_history_interval_seconds=fallback_history_interval_seconds,
-        supports_hidden_wake=str(bootstrap["delivery_strategy"]) == "hidden_wake",
+    initial_state = prepare_watch_state(
+        WatchState(
+            watch_id=resolved_watch_id,
+            target_session_key=normalized_session_key,
+        ),
+        target_session_key=normalized_session_key,
+        origin_session_key=str(bootstrap["origin_session_key"]),
+        requested_strategy=str(bootstrap["delivery_strategy"]),
+        supports_hidden_wake=supports_hidden_wake,
+        supports_sessions_send=effective_supports_sessions_send,
     )
+    save_watch_state(resolved_state_file, initial_state)
     return {
         **base_payload,
         "status": "start",
-        "invocation": invocation,
+        "invocation": build_supervisor_invocation(
+            state_file=resolved_state_file,
+            origin_session_key=str(bootstrap["origin_session_key"]),
+            debounce_ms=debounce_ms,
+            fallback_history_interval_seconds=fallback_history_interval_seconds,
+        ),
     }
 
 

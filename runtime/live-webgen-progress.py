@@ -298,6 +298,21 @@ def run_watch_cycle(
     previous_sample = session_file_sample_from_state(updated_state)
     sample_path = Path(updated_state.session_file_path) if updated_state.session_file_path.strip() else None
     current_sample = sample_session_file_fn(sample_path)
+    if sample_path is not None and not current_sample.exists:
+        refreshed_state = resolve_or_refresh_session_file(
+            updated_state,
+            session_key=current_session_key,
+            resolver=session_file_resolver,
+        )
+        refreshed_path = (
+            Path(refreshed_state.session_file_path)
+            if refreshed_state.session_file_path.strip()
+            else None
+        )
+        if refreshed_path != sample_path:
+            updated_state = refreshed_state
+            sample_path = refreshed_path
+            current_sample = sample_session_file_fn(sample_path)
     file_changed = should_pull_history_from_file_event(previous_sample, current_sample)
 
     if file_changed and debounce_seconds > 0.0:

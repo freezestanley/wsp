@@ -34,6 +34,30 @@ class SessionFileWatchTests(unittest.TestCase):
 
         self.assertEqual(resolved, explicit_path)
 
+    def test_resolve_session_file_path_resolves_relative_session_file_against_sessions_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sessions_dir = root / "agents" / "webgen" / "sessions"
+            sessions_dir.mkdir(parents=True)
+            (sessions_dir / "sessions.json").write_text(
+                json.dumps(
+                    {
+                        "agent:webgen:proj-demo": {
+                            "sessionFile": "nested/demo.jsonl",
+                            "sessionId": "ignored-id",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            resolved = session_file_watch.resolve_session_file_path(
+                "agent:webgen:proj-demo",
+                root=root,
+            )
+
+        self.assertEqual(resolved, sessions_dir / "nested" / "demo.jsonl")
+
     def test_resolve_session_file_path_falls_back_to_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

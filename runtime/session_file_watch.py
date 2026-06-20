@@ -55,7 +55,10 @@ def resolve_session_file_path(session_key: str, root: Path | None = None) -> Pat
 
     session_file = str(metadata.get("sessionFile") or "").strip()
     if session_file:
-        return Path(session_file).expanduser()
+        candidate = Path(session_file).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        return sessions_dir / candidate
 
     session_id = str(metadata.get("sessionId") or "").strip()
     if session_id:

@@ -42,6 +42,14 @@ class WatchState:
     session_file_inode: int = 0
     last_session_event_at: float = 0.0
     last_history_pull_at: float = 0.0
+    last_delivered_seq: int = -1
+    pending_broadcast_items: list[dict[str, Any]] | None = None
+    pending_count: int = 0
+    last_pending_summary: str = ""
+    supervisor_pid: int = 0
+    supervisor_started_at: float = 0.0
+    supervisor_heartbeat_at: float = 0.0
+    delivery_degraded_reason: str = ""
 
 
 def is_terminal_watch(state: WatchState) -> bool:
@@ -61,30 +69,27 @@ def needs_final_delivery(state: WatchState) -> bool:
     return is_terminal_watch(state) and not state.final_delivered
 
 
+def watch_requires_supervisor(state: WatchState) -> bool:
+    return bool(state.target_session_key.strip()) and not is_terminal_watch(state)
+
+
+def watch_is_delivery_degraded(state: WatchState) -> bool:
+    return state.delivery_strategy == "manual_pull"
+
+
 def _replace_state(state: WatchState, **changes: Any) -> WatchState:
     return replace(state, **changes)
 
 
-def _read_state_store(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"watches": {}}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        return {"watches": {}}
-    watches = data.get("watches")
-    if not isinstance(watches, dict):
-        return {"watches": {}}
-    return {"watches": watches}
-
-
-def load_watch_state(path: Path, watch_id: str, target_session_key: str | None = None) -> WatchState:
-    store = _read_state_store(path)
-    raw = store["watches"].get(watch_id)
-    if not isinstance(raw, dict):
-        return WatchState(
-            watch_id=watch_id,
-            target_session_key=target_session_key or "",
-        )
+def _watch_state_from_raw(
+    watch_id: str,
+    raw: dict[str, Any],
+    *,
+    target_session_key: str = "",
+) -> WatchState:
+    pending_items = raw.get("pending_broadcast_items")
+    if not isinstance(pending_items, list):
+        pending_items = []
     return WatchState(
         watch_id=watch_id,
         target_session_key=str(raw.get("target_session_key") or target_session_key or ""),
@@ -115,6 +120,41 @@ def load_watch_state(path: Path, watch_id: str, target_session_key: str | None =
         session_file_inode=int(raw.get("session_file_inode", 0)),
         last_session_event_at=float(raw.get("last_session_event_at", 0.0)),
         last_history_pull_at=float(raw.get("last_history_pull_at", 0.0)),
+        last_delivered_seq=int(raw.get("last_delivered_seq", -1)),
+        pending_broadcast_items=pending_items,
+        pending_count=int(raw.get("pending_count", len(pending_items))),
+        last_pending_summary=str(raw.get("last_pending_summary", "")),
+        supervisor_pid=int(raw.get("supervisor_pid", 0)),
+        supervisor_started_at=float(raw.get("supervisor_started_at", 0.0)),
+        supervisor_heartbeat_at=float(raw.get("supervisor_heartbeat_at", 0.0)),
+        delivery_degraded_reason=str(raw.get("delivery_degraded_reason", "")),
+    )
+
+
+def _read_state_store(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"watches": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {"watches": {}}
+    watches = data.get("watches")
+    if not isinstance(watches, dict):
+        return {"watches": {}}
+    return {"watches": watches}
+
+
+def load_watch_state(path: Path, watch_id: str, target_session_key: str | None = None) -> WatchState:
+    store = _read_state_store(path)
+    raw = store["watches"].get(watch_id)
+    if not isinstance(raw, dict):
+        return WatchState(
+            watch_id=watch_id,
+            target_session_key=target_session_key or "",
+        )
+    return _watch_state_from_raw(
+        watch_id,
+        raw,
+        target_session_key=target_session_key or "",
     )
 
 
@@ -123,6 +163,32 @@ def save_watch_state(path: Path, state: WatchState) -> None:
     store["watches"][state.watch_id] = asdict(state)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def take_pending_broadcast_batch(
+    state: WatchState,
+    max_items: int | None = None,
+) -> tuple[list[dict[str, Any]], WatchState]:
+    all_items = list(state.pending_broadcast_items or [])
+    if max_items is None:
+        batch = list(all_items)
+        remaining: list[dict[str, Any]] = []
+    else:
+        safe_max_items = max(int(max_items), 0)
+        batch = list(all_items[:safe_max_items])
+        remaining = list(all_items[safe_max_items:])
+    last_delivered_seq = state.last_delivered_seq
+    for item in batch:
+        seq = item.get("seq")
+        if isinstance(seq, int) and seq > last_delivered_seq:
+            last_delivered_seq = seq
+    return batch, replace(
+        state,
+        pending_broadcast_items=remaining,
+        pending_count=len(remaining),
+        last_pending_summary=str(remaining[-1].get("summary", "")) if remaining else "",
+        last_delivered_seq=last_delivered_seq,
+    )
 
 
 def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
@@ -134,39 +200,7 @@ def resolve_visible_wake_state(text: str, path: Path) -> WatchState | None:
     for watch_id, raw in store["watches"].items():
         if not isinstance(watch_id, str) or not isinstance(raw, dict):
             continue
-        candidates.append(
-            WatchState(
-                watch_id=watch_id,
-                target_session_key=str(raw.get("target_session_key") or ""),
-                origin_session_key=str(raw.get("origin_session_key") or ""),
-                delivery_strategy=str(raw.get("delivery_strategy") or "hidden_wake"),
-                status=str(raw.get("status") or "pending"),
-                lease_owner=str(raw.get("lease_owner") or ""),
-                lease_until=float(raw.get("lease_until", 0.0)),
-                last_worker_heartbeat_at=float(raw.get("last_worker_heartbeat_at", 0.0)),
-                last_seen_seq=int(raw.get("last_seen_seq", -1)),
-                last_broadcast_seq=int(raw.get("last_broadcast_seq", -1)),
-                phase=str(raw.get("phase", "implementing")),
-                last_heartbeat_at=float(raw.get("last_heartbeat_at", 0.0)),
-                idle_poll_count=int(raw.get("idle_poll_count", 0)),
-                last_progress_summary=str(raw.get("last_progress_summary", "")),
-                last_control_event_id=str(raw.get("last_control_event_id", "")),
-                pending_control_summary=str(raw.get("pending_control_summary", "")),
-                last_context_band=str(raw.get("last_context_band", "ok")),
-                last_context_nudge_at=float(raw.get("last_context_nudge_at", 0.0)),
-                awaiting_context_ack=bool(raw.get("awaiting_context_ack", False)),
-                final_delivered=bool(raw.get("final_delivered", False)),
-                final_summary=str(raw.get("final_summary", "")),
-                needs_rechain=bool(raw.get("needs_rechain", False)),
-                rechain_reason=str(raw.get("rechain_reason", "")),
-                session_file_path=str(raw.get("session_file_path", "")),
-                session_file_mtime=float(raw.get("session_file_mtime", 0.0)),
-                session_file_size=int(raw.get("session_file_size", 0)),
-                session_file_inode=int(raw.get("session_file_inode", 0)),
-                last_session_event_at=float(raw.get("last_session_event_at", 0.0)),
-                last_history_pull_at=float(raw.get("last_history_pull_at", 0.0)),
-            )
-        )
+        candidates.append(_watch_state_from_raw(watch_id, raw))
 
     if not candidates:
         return None

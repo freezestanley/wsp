@@ -24,6 +24,9 @@ from runtime.live_watch import (
     resolve_visible_wake_state,
     save_watch_state,
     summarize_new_messages,
+    take_pending_broadcast_batch,
+    watch_is_delivery_degraded,
+    watch_requires_supervisor,
 )
 from runtime.live_wake_token import decode_wake_token, encode_wake_token, format_visible_wake_text
 
@@ -75,6 +78,14 @@ class LiveWatchTests(unittest.TestCase):
                 session_file_inode=654,
                 last_session_event_at=790.0,
                 last_history_pull_at=791.0,
+                last_delivered_seq=38,
+                pending_broadcast_items=[{"seq": 40, "summary": "🔧 正在验证"}],
+                pending_count=1,
+                last_pending_summary="🔧 正在验证",
+                supervisor_pid=4321,
+                supervisor_started_at=792.0,
+                supervisor_heartbeat_at=793.0,
+                delivery_degraded_reason="manual_pull_requires_user_turn",
             )
 
             save_watch_state(path, original)
@@ -109,6 +120,78 @@ class LiveWatchTests(unittest.TestCase):
         self.assertEqual(loaded.last_worker_heartbeat_at, 0.0)
         self.assertFalse(loaded.final_delivered)
         self.assertEqual(loaded.final_summary, "")
+
+    def test_watch_requires_supervisor_and_manual_pull_is_degraded(self) -> None:
+        manual_pull = WatchState(
+            watch_id="watch-manual",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="manual_pull",
+        )
+        rebroadcast = WatchState(
+            watch_id="watch-rebroadcast",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="rebroadcast",
+        )
+        done = WatchState(
+            watch_id="watch-done",
+            target_session_key="agent:webgen:proj-demo",
+            delivery_strategy="manual_pull",
+            status="done",
+            phase="done",
+        )
+
+        self.assertTrue(watch_requires_supervisor(manual_pull))
+        self.assertTrue(watch_requires_supervisor(rebroadcast))
+        self.assertFalse(watch_requires_supervisor(done))
+        self.assertTrue(watch_is_delivery_degraded(manual_pull))
+        self.assertFalse(watch_is_delivery_degraded(rebroadcast))
+
+    def test_take_pending_broadcast_batch_returns_items_and_clears_backlog(self) -> None:
+        state = WatchState(
+            watch_id="watch-backlog",
+            target_session_key="agent:webgen:proj-demo",
+            pending_broadcast_items=[
+                {"seq": 41, "summary": "🔧 正在构建"},
+                {"seq": 42, "summary": "✅ 构建成功"},
+            ],
+            pending_count=2,
+            last_pending_summary="✅ 构建成功",
+            last_delivered_seq=40,
+        )
+
+        batch, updated = take_pending_broadcast_batch(state)
+
+        self.assertEqual(len(batch), 2)
+        self.assertEqual(batch[0]["seq"], 41)
+        self.assertEqual(updated.pending_broadcast_items, [])
+        self.assertEqual(updated.pending_count, 0)
+        self.assertEqual(updated.last_pending_summary, "")
+        self.assertEqual(updated.last_delivered_seq, 42)
+
+    def test_take_pending_broadcast_batch_respects_max_items_and_keeps_remaining_backlog(self) -> None:
+        state = WatchState(
+            watch_id="watch-backlog",
+            target_session_key="agent:webgen:proj-demo",
+            pending_broadcast_items=[
+                {"seq": 41, "summary": "🔧 正在构建"},
+                {"seq": 42, "summary": "✅ 构建成功"},
+                {"seq": 43, "summary": "📸 正在截图"},
+            ],
+            pending_count=3,
+            last_pending_summary="📸 正在截图",
+            last_delivered_seq=40,
+        )
+
+        batch, updated = take_pending_broadcast_batch(state, max_items=2)
+
+        self.assertEqual(batch, [
+            {"seq": 41, "summary": "🔧 正在构建"},
+            {"seq": 42, "summary": "✅ 构建成功"},
+        ])
+        self.assertEqual(updated.pending_broadcast_items, [{"seq": 43, "summary": "📸 正在截图"}])
+        self.assertEqual(updated.pending_count, 1)
+        self.assertEqual(updated.last_pending_summary, "📸 正在截图")
+        self.assertEqual(updated.last_delivered_seq, 42)
 
     def test_has_active_lease_respects_expiry(self) -> None:
         active = WatchState(

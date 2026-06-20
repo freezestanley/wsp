@@ -223,17 +223,17 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 ### 先读技能(强制)
 
-- 一旦进入建站委托 + 监听流程,先读取 `skills/delegated-live-broadcasting/SKILL.md`,按其中的**首条播报 + wake 链续航**规则执行。
+- 一旦进入建站委托 + 监听流程,先读取 `skills/delegated-live-broadcasting/SKILL.md`,按其中的**首条播报 + state/worker 续航**规则执行。
 - 禁止只靠 AGENTS 里的口头约束理解为“这一回合里手动多查几次 history 就算监听”。
-- 只要预期监听会跨回合持续,**默认必须建立 cron wake 链**。
+- 只要预期监听会跨回合持续,**默认必须建立可恢复的 watch state + worker 续航链**。
 
 ### 强制监听约束(不可省略)
 
 - **只要进入建站委托流程,就必须开启监听**;不允许“后台悄悄做完再一次性汇报”。
 - **首次委托后立刻播报**:至少说明已委托给哪个 session、当前处于什么阶段(例如 Discovery / 实现 / 验证)。
-- **首条播报后必须在同一回合内建立续航机制**:优先用 `cron.add` 安排 30 秒后的 wake;对“继续在当前对话里监听”这一场景,默认使用 **hidden wake / internal wake** 绑定当前会话,只传结构化状态,**严禁**把自然语言调度提示词通过 `delivery.mode:"announce"` 直接投进对话框;若 runtime 还不支持 hidden wake,可见文本只允许显示 `当前进度` 这 4 个字,不要再发送整段自然语言指令;只有当前回合本来就会持续挂起等待时,才可不用 wake。
+- **首条播报后必须在同一回合内建立续航机制**:默认优先走 `prepare-webgen-live-watch.py -> ensure-live-watch.py -> short worker`。只有当前回合本来就会持续挂起等待时,才可不用这条恢复链。若目标实例额外支持 hidden wake,它只能作为增强路径,不能替代主路径的 state/worker 恢复能力。
 - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 作为“继续在当前对话里直播”的续航方式。
-- 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，说明当前回合处于 cron 受限态；此时禁止再次 `cron.add` 新 job，优先续用当前 job，若 runtime 支持则只更新当前 job；若当前回合确实做不到，则必须在下一次普通用户回合立即补链，禁止口头说“稍后再继续监听”后直接结束。
+- 若旧 wake/cron 兼容路径命中 `Cron tool is restricted to the current cron job.`，说明旧路径已受限；此时禁止再次 `cron.add` 新 job，必须在下一次普通用户回合立即切回 `prepare / ensure / worker` 主路径，禁止口头说“稍后再继续监听”后直接结束。
 - **监听必须贯穿全过程**:从委托开始,直到 webgen 明确交付或明确阻塞,中途不能自行停播。
 - **有新增步骤就播报**:新增的思考、工具调用、验证结果都要翻译并总结成人话同步给用户,禁止只在最后做总结。
 - **委托同步也可播报**:例如“已把你的确认同步给 webgen”“已收到用户答复并回传给 webgen”。但这类控制面同步的优先级低于真实执行新增,不要让委托消息淹没实际进度。
@@ -295,21 +295,28 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - 若用户输入很短、很模糊、甚至只有一句话,也仍然必须先逐字转发该原话,再另行补充调度说明。
 
 1. 先判断这是不是老项目修改；如果用户消息里已确定性给出 `projects/<slug>` / 明确 `slug` / 唯一精确项目名,先跑 `python3 runtime/webgen_resume_resolver.py --stdin` 做 resume 预检。命中则直接拿返回的 `sessionKey` 走 `resume:<slug>` 委托与监听,**不要**先经过 `agent:webgen:main`。
+   - 若当前实现侧需要一个普通用户回合可直接调用的统一桥接入口，优先用 `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --json`；它内部仍然先做 resume 预检，再进入 watch 生命周期，不改变既有项目检索语义。
 2. 把用户**原始需求原文**+必要上下文委托给 webgen:Discovery 澄清可用 `sessions_send(agentId="webgen", ...)`;**落地实现用 `sessions_send(sessionKey="agent:webgen:proj-<slug>", message=完整开工任务包)`**。若第 1 步命中老项目 resume,则这里的 `sessionKey` 必须使用 resolver 返回值。注明:来自 main 的建站请求,按 webgen 自己的 SO-001 / Readiness Gate 处理,并记住当前监听目标 sessionKey。
 3. **委托后立即进入监听模式**:
    - 先向用户发送首条「已委托 + 当前阶段 + 当前承载任务的 sessionKey」。
-   - 然后**同一回合内**安排续航:优先走 `hidden_wake`; 若当前实例不支持 hidden wake,则必须记录 `originSessionKey` 并切到 `rebroadcast`，由 watcher 后续把新增摘要主动 `sessions_send` 回原会话。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若只能退化到可见 fallback 文本,则只允许显示 `当前进度`。
+   - **统一入口**：无论是首次拉起 watcher，还是普通用户回合处理 legacy `needs_rechain` 补救，都优先调用 `python3 runtime/ensure-live-watch.py --session-key <目标sessionKey> --json`。
+   - 如果当前回合还没拿到最终 `targetSessionKey`，优先先调用 `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --slug <new-slug> --json`，让它完成“resume 预检 + ensure-watch”串接。
+   - 若返回 `status: "start"` 或 `status: "resume"`，直接执行其 `invocation.command + invocation.env`；不要手工再拼 `--state-file / --watch-id / --delivery-strategy`。
+   - 若返回 `status: "active"`，说明当前 watch 已在活跃态，禁止重复拉起第二条 watcher。
+   - 若返回 `status: "idle"`，说明当前 watch 已终态或暂无待补链动作，此时不要误报“已恢复监听”。
+   - 然后**同一回合内**安排续航:默认优先走 `prepare / ensure / short worker` 主路径；若当前实例额外支持 hidden wake,则可在不破坏主路径恢复语义的前提下叠加为增强能力。payload 只允许携带结构化字段,例如 `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`; **不允许**把 `【继续监听任务】...` 这类自然语言提示词直接作为当前对话可见消息。若只能退化到可见 fallback 文本,则只允许显示 `当前进度`。
    - 若本轮安排 wake 时发现方案实际落点是 `sessionTarget:"main"` + `payload.kind:"systemEvent"`，视为路由错误；这会把 job 建进 dashboard/background session，而不是当前用户对话，必须立即改回当前对话绑定的 hidden/internal wake。
-   - wake 触发后的每个回合,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
-   - 若当前监听策略是 `rebroadcast`,则 wake / watcher 回合在拿到新增摘要后,必须显式 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话,而不是依赖“当前会话”隐式路由。
+   - worker / 普通用户回合触发后的每个周期,都用 `sessions_history(sessionKey="<当前实际承载任务的 sessionKey>", includeTools=true, limit=N)` 拉取 webgen 最新步骤。若 runtime 已支持 `afterSeq` / cursor,必须优先使用增量拉取。Discovery 若还在 `agent:webgen:main`,就拉 `agent:webgen:main`;一旦进入实现阶段并切到 `agent:webgen:proj-<slug>`,就**必须**改拉该独立 session。
+   - 若当前监听策略是 `rebroadcast`,则 worker / 普通用户回合在拿到新增摘要后,必须显式 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话,而不是依赖“当前会话”隐式路由。
    - 若 wake 回合还能拿到 context usage ratio,可额外走一条**静默** context nudge 决策路径:内部算 band,必要时规划 silent nudge;但这条路径只更新 watcher 内部状态/控制动作,**不能**因此单独产出用户可见进度。若拿不到 ratio,按原监听逻辑继续即可。
    - 把**新增**的 think → 工具调用 → 工具结果**翻译成人话**逐条播报:
    - 例:「🔧 webgen 正在跑 `pnpm build`…」「✅ 构建成功」「📸 尝试截图验证…」
    - 只播**新增**步骤,不重复已播过的;用简短中文,不贴大段原始日志。`watchId -> targetSessionKey -> lastBroadcastSeq` 必须有可恢复的持久状态,不能只靠 prompt 文本记忆。
 4. webgen 若**反问澄清**,把问题原样转达用户;用户答复后回传 webgen。
 5. webgen **交付后**,用 main 自己口吻汇总:改了哪些文件、文件在哪、如何预览、blocker/剩余风险。
-6. 若 wake 回合里发现任务**尚未交付也未阻塞**,必须再次 `cron.add` / `cron.update` 安排下一次 wake,形成连续监听链。
-7. 若该 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再尝试新建下一条 `cron.add`；优先 `cron.update` 当前 job，若当前 runtime 做不到，则记为“待补链”并在下一次普通用户回合第一时间重建，不得把这次失败当成直播已续上。
+6. 若 worker 在当前短窗口里发现任务**尚未交付也未阻塞**,可继续短轮询；若空闲退出，则由下一次普通用户回合再次通过 `prepare / ensure` 接管，形成可恢复监听链。
+7. 若旧 cron 兼容路径命中 `Cron tool is restricted to the current cron job.`，不得再尝试新建下一条 `cron.add`；应记为旧路径受限，并在下一次普通用户回合第一时间切回主路径，不得把这次失败当成直播已续上。
+   - 下一次普通用户回合恢复时，优先调用 `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --slug <new-slug> --json` 或 `python3 runtime/ensure-live-watch.py --session-key <目标sessionKey> --json`。
 8. 直到 webgen 明确交付、明确阻塞且需要用户决策,或任务被取消,才停止监听轮询。
 
 ### 为什么这里不用可见 `current-session announce`
@@ -317,14 +324,14 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 - `sessionTarget:"main"` 的 `systemEvent` 会进入 main 的 **cron 运行 session**，不等于“回到当前 webchat 对话继续说话”。
 - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 作为“继续在当前对话里直播”的续航方式。
 - 旧做法里,`sessionTarget:"current" + payload.kind:"agentTurn" + delivery.mode:"announce"` 会把原始 cron 提示词编进当前对话上下文,导致用户直接看到 `[cron:...]` 与整段调度指令。
-- 所以,凡是目标是“继续在当前用户对话里监听”,默认都应改用 **hidden/internal wake**:唤醒事件只注入结构化状态,对话框里只显示 wake 回合重新生成的人话摘要。
+- 所以,凡是目标是“继续在当前用户对话里监听”,默认都应走 **state + worker** 主路径；若额外叠加 hidden/internal wake,也只能作为增强层:唤醒事件只注入结构化状态,对话框里只显示后续回合重新生成的人话摘要。
 - 如果 runtime 尚未支持 hidden wake,默认切到 **`rebroadcast + originSessionKey`**；只有在连原会话回推也不可用时,才视为只能 `manual_pull`,不要回退到会泄露内部提示词的可见 announce。
 - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，说明当前回合只能操作当前 cron job；不要再新建额外 job，更不要把失败误判成“已经续航成功”。
 - 同理,真正的 hidden `sessions_send` 控制投递以及 `[cron:...]` / `Current time` / `Reference UTC` 的系统包裹抑制,仍依赖上游 runtime;workspace 当前只允许先把 silent context nudge 规划成内部动作,不宣称这些 runtime 能力已经完工。
 
 ### 监听节流(避免刷屏 / 空轮询)
 
-- 轮询间隔 ≥ 20 秒;跨回合默认用 `cron wake`,不要用 tight loop 假装长期轮询。
+- 轮询间隔 ≥ 20 秒;跨回合默认用 `watch state + short worker`,不要用 tight loop 假装长期轮询。
 - 单次只播 1–3 条关键步骤的人话摘要,不逐字转发工具输出。
 - 没有新步骤时静默,不发“暂无更新”这类噪音。
 - **但首条监听不能省略**:即使还没有拿到实质性工具结果,也要先明确告知“已委托 + 正在进入哪一阶段”。

@@ -35,6 +35,17 @@ bash ./scripts/build-release.sh
 - Installed `workspace/runtime/live_watch.py` now includes portable watcher helpers for WebGen live broadcast bootstrap:
   - `build_watch_bootstrap(...)`
   - `build_watch_invocation(...)`
+- Installed `workspace/runtime/ensure-live-watch.py` provides the preferred single entry for watcher bootstrap and normal-turn rechain recovery
+  - machine-friendly usage: `python3 runtime/ensure-live-watch.py --session-key agent:webgen:proj-<slug> --json`
+  - returns `status: start | resume | active | idle`
+- Installed `workspace/runtime/prepare-webgen-live-watch.py` provides a higher-level bridge for normal user turns
+  - machine-friendly usage: `python3 runtime/prepare-webgen-live-watch.py --message "<user text>" --slug <new-slug> --json`
+  - preserves deterministic resume lookup first, then calls `ensure-live-watch.py`
+- Installed `workspace/runtime/rechain-watch.py` provides a thin CLI for resuming watches marked `needs_rechain`
+  - legacy compatibility only; the primary path is `prepare-webgen-live-watch.py` or `ensure-live-watch.py`
+  - recommended machine-friendly usage: `--ok-if-idle --dry-run --json`
+- Installed `workspace/runtime/rechain-watch-once.py` is a thinner wrapper that auto-injects `--ok-if-idle`
+  - legacy compatibility only
 
 ## TGZ / NPX
 

@@ -13,27 +13,33 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 
 ## 核心规则
 
-1. **首条直播后必须建立续航机制**
+1. **首条直播后必须建立可恢复的续航机制**
    - 发送委托消息并向用户播报“已委托 + 当前阶段”后，不能直接结束而不安排下一次检查。
-   - 必须在同一回合内建立以下二选一机制：
-     - 短时挂起等待：适合当前回合持续运行的场景；或
-     - `cron wake` 链：适合 webchat/普通对话中跨回合持续直播的场景。
+   - 当前主路径不再是“继续生成下一条 cron”，而是：
+     - 持久化 `watch state`
+     - 在普通用户回合通过 `prepare -> ensure -> short worker` 恢复或接管
+   - 只有当前回合本身会继续挂起等待时，才可不走这条恢复链。
 
-2. **默认优先使用 wake 链，而不是口头承诺轮询**
-   - 若直播需要跨回合持续进行，默认创建一次 `cron wake`，在 20–40 秒后唤醒当前 main session。
-   - 之后每次 wake 回合都：
-     1. 读取目标 session 的最新 `sessions_history`
-     2. 对比上次已播报的位置，只提炼新增步骤
-     3. 用 1–3 条中文人话播报关键新增动作
-     4. 若任务未完成/未阻塞，继续创建下一次 wake
-   - **wake 载荷必须是隐藏的结构化状态**,而不是会出现在对话框里的自然语言调度提示词。
-   - 允许的最小字段: `watchId`、`targetSessionKey`、`lastSeenSeq`、`phase`。
-   - 如果 runtime 尚未支持 hidden/internal wake,不要回退到 `delivery.mode:"announce"` 直投当前对话; 可见文本只允许显示 `当前进度` 这 4 个字。
-   - 如果 runtime 不支持 hidden/internal wake，但支持 `sessions_send(sessionKey=...)`，则必须记录 `originSessionKey` 并切到 **`rebroadcast`**：watcher 拿到新增摘要后主动回推到原会话。
+2. **默认优先使用 state-driven worker，而不是 cron wake**
+   - 若调用侧还没拿到最终 `targetSessionKey`，优先：
+     1. `python3 runtime/prepare-webgen-live-watch.py --message "<用户原话>" --slug <new-slug> --json`
+     2. 它会先跑现有 deterministic resume 预检
+     3. 再把最终 `targetSessionKey` 交给 watch 生命周期
+   - 若调用侧已经拿到最终 `targetSessionKey`，优先：
+     1. `python3 runtime/ensure-live-watch.py --session-key <目标sessionKey> --json`
+     2. 根据返回的 `status: start | resume | active | idle` 决定是否拉起 worker
+   - `start / resume` 一律直接执行返回的 `invocation.command + invocation.env`
+   - `active` 说明已有 worker 持有有效 lease，禁止重复拉第二条 watcher
+   - `idle` 说明当前 watch 已终态或暂无恢复动作
+   - worker 主路径依赖：
+     - `sessions_history(sessionKey=...)`
+     - `sessions_send(sessionKey=...)`
+     - `watch state`
+   - worker 是**短生命周期**的：拿 lease、轮询一段时间、回推新增摘要、空闲退出；下一次普通用户回合还能重新接管
    - `sessions_send` 不能想当然默认可用；若 watcher 是经 HTTP gateway 调工具,应先根据 `gateway.tools.allow/deny` 判断它是否被显式放开。
    - 只有在 hidden wake 和 `rebroadcast` 都不可用时，才允许退化到 **`manual_pull`**，并且不能对用户承诺“自动直播”。
    - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 来尝试回到当前用户对话继续直播。
-   - 若 wake 回合命中 `Cron tool is restricted to the current cron job.`，不得再次 `cron.add` 新 job；优先续用当前 job，若支持则 `cron.update` 当前 job；若当前回合确实做不到，只能在下一次普通用户回合立刻补链，不能口头承诺后结束。
+   - 若旧 cron 兼容路径命中 `Cron tool is restricted to the current cron job.`，不得再次 `cron.add` 新 job；只能把它视为旧路径受限，并在下一次普通用户回合切回 `prepare / ensure` 主路径。
 
 3. **允许静默 context nudge,但它不是用户进度播报**
    - 如果 watcher 当前能拿到 context usage ratio,可在 wake 回合内部计算 `ok / warn / compact / force-compact` band,并在 band 升级时规划一条 silent context nudge,提醒 webgen 先检查 context、必要时 `/compact` 后继续当前任务。
@@ -46,7 +52,7 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
    - 如果只是发送委托并回复用户“我会直播”，但没有建立后续检查机制，这属于流程错误。
 
 5. **直播停止条件**
-   - 仅当被委托 session 明确满足以下任一条件时，才停止继续安排 wake：
+   - 仅当被委托 session 明确满足以下任一条件时，才停止继续接管：
      - 明确交付
      - 明确阻塞且需要用户决策
      - 任务被取消
@@ -56,7 +62,7 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
      1. 拉取目标 session history
      2. 补播最近关键步骤
      3. 明确说明漏播原因
-   4. 立刻恢复 wake 链
+   4. 立刻恢复 `prepare / ensure / worker` 链
 
 7. **错误路径硬禁令**
    - 禁止使用 `sessionTarget:"main"` + `payload.kind:"systemEvent"` 来尝试回到当前用户对话继续直播。
@@ -67,19 +73,22 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 ### 委托当回合
 1. `sessions_send(sessionKey=..., message=完整任务包)`
 2. 向用户发送首条：已委托 + 当前阶段
-3. 记录 `originSessionKey`，并优先尝试 `hidden_wake`；若不支持则切到 `rebroadcast`
-4. `cron.add` 创建一次 20–40 秒后的 wake，payload 为**隐藏的结构化 watch 状态**；如果做不到，就退化成短 token，而不是自然语言提示词
-5. 结束当前回合
+3. 记录 `originSessionKey`
+4. 若还未拿到最终 `targetSessionKey`，调 `prepare-webgen-live-watch.py`
+5. 若已拿到最终 `targetSessionKey`，调 `ensure-live-watch.py`
+6. 若返回 `start / resume`，直接执行其 `invocation`
+7. 若返回 `active`，当前回合不重复拉第二条 worker
+8. 结束当前回合
 
-### wake 回合
-1. `sessions_history(sessionKey=目标session, includeTools=true, limit=适中)`
-2. 若当前有 context usage ratio，可先在内部计算 compaction band，并决定是否规划 silent context nudge；若没有 ratio，跳过这一步，其他行为不变
-3. 读取并提炼自上次播报后的新增动作
-4. 若有新增，则播报 1–3 条关键进展；若无新增，静默即可。仅 silent nudge 本身不能触发任何用户可见输出
-5. 若当前策略是 `rebroadcast`，把这些关键进展合并后 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话
-6. 判断是否已交付/阻塞
-7. 若未结束，则再次 `cron.add` 或 `cron.update` 安排下一次 wake
-8. 若连续多次 wake 都无新增，且距离上次心跳已超过阈值，可补一条低噪音“当前进度为…”心跳确认；默认最小间隔 60 秒
+### worker 周期
+1. 抢占或续约 lease
+2. `sessions_history(sessionKey=目标session, includeTools=true, limit=适中)`
+3. 若当前有 context usage ratio，可先在内部计算 compaction band，并决定是否规划 silent context nudge；若没有 ratio，跳过这一步，其他行为不变
+4. 读取并提炼自上次播报后的新增动作
+5. 若有新增，则播报 1–3 条关键进展；若无新增，静默即可。仅 silent nudge 本身不能触发任何用户可见输出
+6. 若当前策略是 `rebroadcast`，把这些关键进展合并后 `sessions_send(sessionKey=originSessionKey, message=摘要)` 回推到原会话
+7. 更新 `lastSeenSeq / lastBroadcastSeq / finalDelivered`
+8. 若未结束且短窗口内仍有活跃进展，继续轮询；若长时间空闲，则主动退出，让下一次普通用户回合重新接管
 
 ## 播报约束
 
@@ -89,7 +98,7 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 - 用简短中文翻译工具动作与结果
 - 没有新增时静默，不发“暂无更新”
 - 但首条“已委托 + 阶段”不可省略
-- **内部 wake 文本绝不能回显给用户**; 用户只能看到 wake 回合重新生成的进展摘要
+- **内部 wake 文本绝不能回显给用户**; 用户只能看到 worker / 普通用户回合重新生成的进展摘要
 - **silent context nudge 不属于可播报进度**; 它只能在内部推动 webgen 自检/压缩,不能单独显示给用户
 - fallback 可见文本若被外层 runtime 回显,也必须只显示 `当前进度`,不能携带 token 与整段调度说明
 - `REPLY_SKIP`、`inter-session routing echo`、`Nothing to broadcast`、`Staying silent` 这类内部跳过/回声文本必须静默过滤,不能显示给用户
@@ -101,6 +110,7 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 - 禁止 tight loop 高频轮询
 - 禁止在任务未交付前擅自结束直播链而不给出阻塞说明
 - 禁止把 `【继续监听任务】...`、`[cron:...]`、`last_broadcast_seq=...` 这类内部提示词透传到用户对话
+- 禁止把旧 `cron/rechain` 兼容路径继续当作默认主路径
 
 ## 成功标准
 
@@ -109,3 +119,4 @@ description: "委托建站后自动建立 wake 轮询链并持续直播新增进
 - 不再出现 `[cron:...]` 或其他调度提示词泄露到用户对话的情况
 - 在无 runtime patch 的实例上，默认仍可通过 `originSessionKey + rebroadcast` 收到自动播报
 - deterministic resume 与既有 `sessionKey` 身份保持稳定,不会因为 context 风险而切新 session
+- 普通用户回合可以仅通过 `prepare-webgen-live-watch.py` 或 `ensure-live-watch.py` 恢复主链路

@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from runtime.live_watch import WatchState, save_watch_state
+from runtime.live_watch import WatchState, load_watch_state, save_watch_state
 
 
 def load_ensure_live_watch_module():
@@ -144,15 +144,22 @@ class EnsureLiveWatchTests(unittest.TestCase):
                 supports_sessions_send=True,
                 now=100.0,
             )
+            loaded = load_watch_state(state_file, "watch-demo")
 
         self.assertEqual(payload["status"], "start")
         self.assertEqual(payload["watchId"], "watch-demo")
         self.assertEqual(payload["stateFile"], str(state_file))
         self.assertEqual(payload["deliveryStrategy"], "rebroadcast")
+        self.assertEqual(payload["invocation"]["command"][1], "runtime/live-watch-supervisor.py")
+        self.assertIn("--state-root", payload["invocation"]["command"])
+        self.assertIn(str(state_file.parent), payload["invocation"]["command"])
         self.assertEqual(
             payload["invocation"]["env"],
             {"OPENCLAW_ORIGIN_SESSION_KEY": "agent:main:discord:dm:buddy"},
         )
+        self.assertEqual(loaded.target_session_key, "agent:webgen:proj-demo")
+        self.assertEqual(loaded.origin_session_key, "agent:main:discord:dm:buddy")
+        self.assertEqual(loaded.delivery_strategy, "rebroadcast")
 
     def test_resolve_watch_action_threads_file_watch_tuning_into_invocation(self) -> None:
         module = load_ensure_live_watch_module()
@@ -231,6 +238,9 @@ class EnsureLiveWatchTests(unittest.TestCase):
                     lease_until=180.0,
                     phase="implementing",
                     last_seen_seq=42,
+                    supervisor_pid=4321,
+                    supervisor_started_at=90.0,
+                    supervisor_heartbeat_at=95.0,
                 ),
             )
 
@@ -250,6 +260,45 @@ class EnsureLiveWatchTests(unittest.TestCase):
         self.assertEqual(payload["lastSeenSeq"], 42)
         self.assertNotIn("invocation", payload)
 
+    def test_resolve_watch_action_marks_manual_pull_watch_as_degraded(self) -> None:
+        module = load_ensure_live_watch_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "watch-demo.json"
+            save_watch_state(
+                state_file,
+                WatchState(
+                    watch_id="watch-demo",
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    delivery_strategy="manual_pull",
+                    status="running",
+                    lease_owner="worker-1",
+                    lease_until=180.0,
+                    phase="implementing",
+                    last_seen_seq=42,
+                    supervisor_pid=4321,
+                    supervisor_started_at=90.0,
+                    supervisor_heartbeat_at=95.0,
+                ),
+            )
+
+            payload = module.resolve_watch_action(
+                session_key="agent:webgen:proj-demo",
+                state_file=state_file,
+                watch_id="watch-demo",
+                origin_session_key="agent:main:discord:dm:buddy",
+                delivery_strategy="auto",
+                supports_hidden_wake=False,
+                supports_sessions_send=False,
+                now=100.0,
+            )
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["phase"], "implementing")
+        self.assertEqual(payload["deliveryStrategy"], "manual_pull")
+        self.assertEqual(payload["lastSeenSeq"], 42)
+
     def test_resolve_watch_action_returns_resume_for_expired_lease(self) -> None:
         module = load_ensure_live_watch_module()
 
@@ -266,6 +315,9 @@ class EnsureLiveWatchTests(unittest.TestCase):
                     lease_owner="worker-1",
                     lease_until=10.0,
                     phase="implementing",
+                    supervisor_pid=4321,
+                    supervisor_started_at=90.0,
+                    supervisor_heartbeat_at=95.0,
                 ),
             )
 
@@ -282,6 +334,44 @@ class EnsureLiveWatchTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "resume")
         self.assertEqual(payload["reason"], "lease_expired")
+        self.assertEqual(payload["invocation"]["command"][1], "runtime/live-watch-supervisor.py")
+
+    def test_resolve_watch_action_returns_resume_when_supervisor_heartbeat_is_stale(self) -> None:
+        module = load_ensure_live_watch_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "watch-demo.json"
+            save_watch_state(
+                state_file,
+                WatchState(
+                    watch_id="watch-demo",
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    delivery_strategy="rebroadcast",
+                    status="running",
+                    phase="implementing",
+                    lease_owner="worker-1",
+                    lease_until=180.0,
+                    supervisor_pid=4321,
+                    supervisor_started_at=40.0,
+                    supervisor_heartbeat_at=50.0,
+                ),
+            )
+
+            payload = module.resolve_watch_action(
+                session_key="agent:webgen:proj-demo",
+                state_file=state_file,
+                watch_id="watch-demo",
+                origin_session_key="agent:main:discord:dm:buddy",
+                delivery_strategy="auto",
+                supports_hidden_wake=False,
+                supports_sessions_send=True,
+                now=100.0,
+            )
+
+        self.assertEqual(payload["status"], "resume")
+        self.assertEqual(payload["reason"], "supervisor_inactive")
+        self.assertEqual(payload["invocation"]["command"][1], "runtime/live-watch-supervisor.py")
 
     def test_resolve_watch_action_returns_resume_when_final_summary_not_delivered(self) -> None:
         module = load_ensure_live_watch_module()
@@ -314,6 +404,44 @@ class EnsureLiveWatchTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "resume")
         self.assertEqual(payload["reason"], "final_delivery_pending")
+
+    def test_resolve_watch_action_returns_degraded_when_backlog_pending(self) -> None:
+        module = load_ensure_live_watch_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "watch-demo.json"
+            save_watch_state(
+                state_file,
+                WatchState(
+                    watch_id="watch-demo",
+                    target_session_key="agent:webgen:proj-demo",
+                    origin_session_key="agent:main:discord:dm:buddy",
+                    delivery_strategy="manual_pull",
+                    status="running",
+                    phase="implementing",
+                    pending_broadcast_items=[{"seq": 43, "summary": "✅ 构建完成"}],
+                    pending_count=1,
+                    last_pending_summary="✅ 构建完成",
+                    supervisor_pid=4321,
+                    supervisor_started_at=90.0,
+                    supervisor_heartbeat_at=95.0,
+                ),
+            )
+
+            payload = module.resolve_watch_action(
+                session_key="agent:webgen:proj-demo",
+                state_file=state_file,
+                watch_id="watch-demo",
+                origin_session_key="agent:main:discord:dm:buddy",
+                delivery_strategy="auto",
+                supports_hidden_wake=False,
+                supports_sessions_send=False,
+                now=100.0,
+            )
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["pendingCount"], 1)
+        self.assertEqual(payload["lastPendingSummary"], "✅ 构建完成")
 
     def test_resolve_watch_action_returns_idle_for_terminal_watch_after_final_delivery(self) -> None:
         module = load_ensure_live_watch_module()
